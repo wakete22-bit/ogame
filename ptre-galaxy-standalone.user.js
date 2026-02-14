@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.29
+// @version      0.7.30
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -86,7 +86,9 @@
     }
     const isGalaxy = /component=galaxy/.test(location.href);
     const isIngameRoot = /page=ingame/.test(location.search || '') && !isGalaxy;
-    if (isIngameRoot) {
+    // Only auto-open galaxy if continuous scan was active before reload.
+    const shouldAutoOpenGalaxy = Boolean(GM_getValue(KEY_CONTINUOUS_ACTIVE, false));
+    if (isIngameRoot && shouldAutoOpenGalaxy) {
         initIngameAutoGalaxy();
     }
 
