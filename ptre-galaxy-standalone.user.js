@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.26
+// @version      0.7.27
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -70,6 +70,9 @@
     const DEFAULT_SYNC_TOKEN = ''; // Must match X-PTRE-Token expected by your VPS endpoint.
     const SYNC_PULL_INTERVAL_MS = 5000;
     const SYNC_PUSH_DEBOUNCE_MS = 700;
+    const SYNC_ACTIVITY_PUSH_DEBOUNCE_MS = 1000;
+    const SYNC_ACTIVITY_BATCH_SIZE = 80;
+    const SYNC_ACTIVITY_MAX_QUEUE = 1000;
     const SYNC_HTTP_TIMEOUT_MS = 10000;
     const SYNC_TOKEN_HEADER = 'x-ptre-token';
 
@@ -114,6 +117,9 @@
     let syncPushTimer = null;
     let syncPushInFlight = false;
     let syncPendingTargets = null;
+    let syncActivityPushTimer = null;
+    let syncActivityPushInFlight = false;
+    let syncPendingActivity = [];
     let syncLastRemoteUpdatedAt = 0;
     let syncLastRemoteSerialized = '';
     let syncOnline = false;
@@ -488,6 +494,48 @@
         return Array.from(set);
     }
 
+    function normalizeActivityValue(value) {
+        const raw = String(value || '-').trim();
+        if (raw === '*') {
+            return '*';
+        }
+        if (raw === '-') {
+            return '-';
+        }
+        if (/^\d+$/.test(raw)) {
+            return raw;
+        }
+        return '-';
+    }
+
+    function normalizeDebrisValue(value) {
+        return String(value || '').trim().toLowerCase() === 'si' ? 'si' : 'no';
+    }
+
+    function normalizeActivityObservation(obs) {
+        if (!obs || typeof obs !== 'object' || Array.isArray(obs)) {
+            return null;
+        }
+        const playerKey = String(obs.playerKey || '').trim();
+        const coords = normalizeCoord(obs.coords);
+        const seenAt = Number(obs.seenAt);
+        const bucketTs = Number(obs.bucketTs);
+        if (!playerKey || !coords || !Number.isFinite(seenAt) || !Number.isFinite(bucketTs) || seenAt <= 0 || bucketTs <= 0) {
+            return null;
+        }
+        const playerName = String(obs.playerName || '').trim() || playerKey;
+        return {
+            playerKey: playerKey,
+            playerName: playerName,
+            coords: coords,
+            planet: normalizeActivityValue(obs.planet),
+            moon: normalizeActivityValue(obs.moon),
+            debris: normalizeDebrisValue(obs.debris),
+            seenAt: seenAt,
+            bucketTs: bucketTs
+        };
+    }
+
     function buildRemoteControlCommand(action, extra) {
         const payload = extra && typeof extra === 'object' ? extra : {};
         return {
@@ -703,6 +751,65 @@
         });
     }
 
+    function queueSlaveActivitySync(obs) {
+        if (!isSyncSlave() || !isSyncConfigured()) {
+            return;
+        }
+        const normalized = normalizeActivityObservation(obs);
+        if (!normalized) {
+            return;
+        }
+        syncPendingActivity.push(normalized);
+        if (syncPendingActivity.length > SYNC_ACTIVITY_MAX_QUEUE) {
+            syncPendingActivity.splice(0, syncPendingActivity.length - SYNC_ACTIVITY_MAX_QUEUE);
+        }
+        if (syncActivityPushTimer) {
+            return;
+        }
+        syncActivityPushTimer = setTimeout(() => {
+            syncActivityPushTimer = null;
+            flushSlaveActivitySync();
+        }, SYNC_ACTIVITY_PUSH_DEBOUNCE_MS);
+    }
+
+    function flushSlaveActivitySync() {
+        if (!isSyncSlave() || !isSyncConfigured() || syncPendingActivity.length === 0) {
+            return;
+        }
+        if (syncActivityPushInFlight) {
+            if (!syncActivityPushTimer) {
+                syncActivityPushTimer = setTimeout(() => {
+                    syncActivityPushTimer = null;
+                    flushSlaveActivitySync();
+                }, SYNC_ACTIVITY_PUSH_DEBOUNCE_MS);
+            }
+            return;
+        }
+        const batch = syncPendingActivity.splice(0, SYNC_ACTIVITY_BATCH_SIZE);
+        if (batch.length === 0) {
+            return;
+        }
+        syncActivityPushInFlight = true;
+        requestSyncJson('PUT', {
+            activityBatch: batch,
+            activityUpdatedAt: Date.now()
+        }).catch((err) => {
+            console.warn('[PTRE sync slave] activity push failed:', err);
+            syncPendingActivity = batch.concat(syncPendingActivity);
+            if (syncPendingActivity.length > SYNC_ACTIVITY_MAX_QUEUE) {
+                syncPendingActivity = syncPendingActivity.slice(syncPendingActivity.length - SYNC_ACTIVITY_MAX_QUEUE);
+            }
+        }).finally(() => {
+            syncActivityPushInFlight = false;
+            if (syncPendingActivity.length > 0 && !syncActivityPushTimer) {
+                syncActivityPushTimer = setTimeout(() => {
+                    syncActivityPushTimer = null;
+                    flushSlaveActivitySync();
+                }, SYNC_ACTIVITY_PUSH_DEBOUNCE_MS);
+            }
+        });
+    }
+
     function sendRemoteControlCommand(controlCommand) {
         if (!isSyncHost()) {
             setStatus('Sync host requerido para control remoto');
@@ -891,9 +998,15 @@
             clearTimeout(syncPushTimer);
             syncPushTimer = null;
         }
+        if (syncActivityPushTimer) {
+            clearTimeout(syncActivityPushTimer);
+            syncActivityPushTimer = null;
+        }
         syncPullInFlight = false;
         syncPushInFlight = false;
+        syncActivityPushInFlight = false;
         syncPendingTargets = null;
+        syncPendingActivity = [];
         syncLastRemoteUpdatedAt = 0;
         syncLastRemoteSerialized = '';
         setSyncOffline('');
@@ -1956,6 +2069,7 @@
     }
 
     function queueObservation(obs) {
+        queueSlaveActivitySync(obs);
         dbQueue = dbQueue.then(() => recordObservation(obs)).catch((err) => {
             console.log('[PTRE Local] DB error', err);
             setStatus('DB error');
@@ -2083,6 +2197,13 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
     const STORE_BUCKETS = ${JSON.stringify(STORE_BUCKETS)};
     const BUCKET_MS = ${BUCKET_MS};
     const RANGE_HOURS = ${DEFAULT_RANGE_HOURS};
+    const REMOTE_HISTORY_ONLY = ${JSON.stringify(isSyncHost())};
+    const REMOTE_ENDPOINT = ${JSON.stringify(syncEndpoint)};
+    const REMOTE_TOKEN = ${JSON.stringify(syncToken)};
+    const REMOTE_TOKEN_HEADER = ${JSON.stringify(SYNC_TOKEN_HEADER)};
+    const REMOTE_REFRESH_MS = 15000;
+    let remoteDataset = { players: [], buckets: [] };
+    let remoteLoadedAt = 0;
 
     function openDb() {
         return openDbInternal(true);
@@ -2145,9 +2266,187 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
         return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
     }
 
-    async function loadPlayers(db) {
+    function setRootMessage(root, text) {
+        root.innerHTML = '';
+        const line = document.createElement('div');
+        line.className = 'meta';
+        line.textContent = text;
+        root.appendChild(line);
+    }
+
+    function buildRemoteActivityUrl() {
+        if (!REMOTE_ENDPOINT) {
+            return '';
+        }
+        try {
+            const url = new URL(REMOTE_ENDPOINT, window.location.href);
+            url.searchParams.set('includeActivity', '1');
+            return url.toString();
+        } catch (err) {
+            const sep = REMOTE_ENDPOINT.indexOf('?') === -1 ? '?' : '&';
+            return REMOTE_ENDPOINT + sep + 'includeActivity=1';
+        }
+    }
+
+    function normalizeActivityValue(value) {
+        const raw = String(value || '-').trim();
+        if (raw === '*') {
+            return '*';
+        }
+        if (raw === '-') {
+            return '-';
+        }
+        if (/^\\d+$/.test(raw)) {
+            return raw;
+        }
+        return '-';
+    }
+
+    function normalizeDebrisValue(value) {
+        return String(value || '').trim().toLowerCase() === 'si' ? 'si' : 'no';
+    }
+
+    function normalizeRemoteDataset(payload) {
+        const data = { players: [], buckets: [] };
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            return data;
+        }
+        const activity = payload.activity;
+        if (!activity || typeof activity !== 'object' || Array.isArray(activity)) {
+            return data;
+        }
+
+        const playersMap = new Map();
+        const rawPlayers = activity.players;
+        if (rawPlayers && typeof rawPlayers === 'object' && !Array.isArray(rawPlayers)) {
+            Object.keys(rawPlayers).forEach((key) => {
+                const rec = rawPlayers[key];
+                if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
+                    return;
+                }
+                const playerKey = String(rec.playerKey || key || '').trim();
+                if (!playerKey) {
+                    return;
+                }
+                const lastSeen = Number(rec.lastSeen || 0);
+                playersMap.set(playerKey, {
+                    playerKey: playerKey,
+                    playerName: String(rec.playerName || playerKey).trim() || playerKey,
+                    lastSeen: Number.isFinite(lastSeen) ? lastSeen : 0
+                });
+            });
+        }
+
+        const rawBuckets = activity.buckets;
+        if (rawBuckets && typeof rawBuckets === 'object' && !Array.isArray(rawBuckets)) {
+            Object.keys(rawBuckets).forEach((id) => {
+                const rec = rawBuckets[id];
+                if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
+                    return;
+                }
+                const playerKey = String(rec.playerKey || '').trim();
+                const bucketTs = Number(rec.bucketTs || 0);
+                if (!playerKey || !Number.isFinite(bucketTs) || bucketTs <= 0) {
+                    return;
+                }
+                const coords = String(rec.coords || 'unknown').trim() || 'unknown';
+                const entries = [];
+                if (Array.isArray(rec.entries)) {
+                    rec.entries.forEach((entry) => {
+                        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+                            return;
+                        }
+                        const t = Number(entry.t || 0);
+                        if (!Number.isFinite(t) || t <= 0) {
+                            return;
+                        }
+                        entries.push({
+                            t: t,
+                            planet: normalizeActivityValue(entry.planet),
+                            moon: normalizeActivityValue(entry.moon),
+                            debris: normalizeDebrisValue(entry.debris)
+                        });
+                    });
+                }
+                const lastUpdatedRaw = Number(rec.lastUpdated || 0);
+                const lastUpdated = Number.isFinite(lastUpdatedRaw) && lastUpdatedRaw > 0
+                    ? lastUpdatedRaw
+                    : (entries.length > 0 ? entries[entries.length - 1].t : bucketTs);
+                const playerName = String(rec.playerName || playerKey).trim() || playerKey;
+                data.buckets.push({
+                    id: String(rec.id || id || (playerKey + '|' + coords + '|' + bucketTs)),
+                    playerKey: playerKey,
+                    playerName: playerName,
+                    coords: coords,
+                    bucketTs: bucketTs,
+                    entries: entries,
+                    lastUpdated: lastUpdated
+                });
+                const existing = playersMap.get(playerKey);
+                if (!existing || lastUpdated >= (existing.lastSeen || 0)) {
+                    playersMap.set(playerKey, {
+                        playerKey: playerKey,
+                        playerName: playerName,
+                        lastSeen: lastUpdated
+                    });
+                }
+            });
+        }
+
+        data.players = Array.from(playersMap.values());
+        return data;
+    }
+
+    async function fetchRemoteDataset() {
+        const url = buildRemoteActivityUrl();
+        if (!url) {
+            throw new Error('Sync endpoint vacío');
+        }
+        const headers = {};
+        if (REMOTE_TOKEN) {
+            headers[REMOTE_TOKEN_HEADER] = REMOTE_TOKEN;
+        }
+        const res = await fetch(url, { method: 'GET', headers: headers });
+        if (!res.ok) {
+            throw new Error('sync http ' + res.status);
+        }
+        const text = await res.text();
+        let payload = {};
+        try {
+            payload = text ? JSON.parse(text) : {};
+        } catch (err) {
+            payload = {};
+        }
+        return normalizeRemoteDataset(payload);
+    }
+
+    async function ensureRemoteDataset(forceRefresh) {
+        if (!REMOTE_HISTORY_ONLY) {
+            return remoteDataset;
+        }
+        const now = Date.now();
+        if (!forceRefresh && remoteLoadedAt > 0 && (now - remoteLoadedAt) < REMOTE_REFRESH_MS) {
+            return remoteDataset;
+        }
+        remoteDataset = await fetchRemoteDataset();
+        remoteLoadedAt = now;
+        return remoteDataset;
+    }
+
+    async function getSource(options) {
+        const opts = options || {};
+        if (REMOTE_HISTORY_ONLY) {
+            return ensureRemoteDataset(Boolean(opts.forceRemote));
+        }
+        return openDb();
+    }
+
+    async function loadPlayers(source) {
+        if (REMOTE_HISTORY_ONLY) {
+            return Array.isArray(source.players) ? source.players.slice() : [];
+        }
         return new Promise((resolve, reject) => {
-            const tx = db.transaction([STORE_PLAYERS], 'readonly');
+            const tx = source.transaction([STORE_PLAYERS], 'readonly');
             const store = tx.objectStore(STORE_PLAYERS);
             const req = store.getAll();
             req.onsuccess = () => resolve(req.result || []);
@@ -2155,9 +2454,19 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
         });
     }
 
-    async function loadDatesForPlayer(db, playerKey) {
+    async function loadDatesForPlayer(source, playerKey) {
+        if (REMOTE_HISTORY_ONLY) {
+            const dates = new Set();
+            const list = Array.isArray(source.buckets) ? source.buckets : [];
+            list.forEach((rec) => {
+                if (rec.playerKey === playerKey) {
+                    dates.add(dateKey(rec.bucketTs));
+                }
+            });
+            return Array.from(dates).sort();
+        }
         return new Promise((resolve, reject) => {
-            const tx = db.transaction([STORE_BUCKETS], 'readonly');
+            const tx = source.transaction([STORE_BUCKETS], 'readonly');
             const store = tx.objectStore(STORE_BUCKETS);
             const idx = store.index('byPlayer');
             const dates = new Set();
@@ -2176,9 +2485,13 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
         });
     }
 
-    async function loadBucketsForPlayer(db, playerKey, startTs, endTs) {
+    async function loadBucketsForPlayer(source, playerKey, startTs, endTs) {
+        if (REMOTE_HISTORY_ONLY) {
+            const list = Array.isArray(source.buckets) ? source.buckets : [];
+            return list.filter((rec) => rec.playerKey === playerKey && rec.bucketTs >= startTs && rec.bucketTs <= endTs);
+        }
         return new Promise((resolve, reject) => {
-            const tx = db.transaction([STORE_BUCKETS], 'readonly');
+            const tx = source.transaction([STORE_BUCKETS], 'readonly');
             const store = tx.objectStore(STORE_BUCKETS);
             const idx = store.index('byPlayer');
             const list = [];
@@ -2336,9 +2649,25 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
         const dateToday = document.getElementById('dateToday');
         const dateNext = document.getElementById('dateNext');
         const clearPlayer = document.getElementById('clearPlayer');
-        const db = await openDb();
+        const meta = document.querySelector('.meta');
+        if (meta) {
+            meta.textContent = REMOTE_HISTORY_ONLY
+                ? 'Fuente: historial remoto del slave.'
+                : 'Selecciona jugador y fecha.';
+        }
 
-        const players = await loadPlayers(db);
+        let source;
+        try {
+            source = await getSource({ forceRemote: true });
+        } catch (err) {
+            playerSelect.innerHTML = '<option value="">-- Selecciona --</option>';
+            dateSelect.innerHTML = '<option value="">-- Selecciona --</option>';
+            dateSelect.disabled = true;
+            setRootMessage(root, 'Error cargando historial remoto: ' + (err && err.message ? err.message : 'desconocido'));
+            return;
+        }
+
+        const players = await loadPlayers(source);
         players.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
 
         const currentPlayer = playerSelect.value;
@@ -2363,7 +2692,14 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
                 if (!key) {
                     return;
                 }
-                const dates = await loadDatesForPlayer(db, key);
+                let sourceNow;
+                try {
+                    sourceNow = await getSource({ forceRemote: REMOTE_HISTORY_ONLY });
+                } catch (err) {
+                    setRootMessage(root, 'Error cargando fechas: ' + (err && err.message ? err.message : 'desconocido'));
+                    return;
+                }
+                const dates = await loadDatesForPlayer(sourceNow, key);
                 dates.forEach((d) => {
                     const opt = document.createElement('option');
                     opt.value = d;
@@ -2391,7 +2727,14 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
                     bucketTimes.push(t);
                 }
 
-                const bucketList = await loadBucketsForPlayer(db, playerKey, startTs, endTs);
+                let sourceNow;
+                try {
+                    sourceNow = await getSource({ forceRemote: REMOTE_HISTORY_ONLY });
+                } catch (err) {
+                    setRootMessage(root, 'Error cargando datos: ' + (err && err.message ? err.message : 'desconocido'));
+                    return;
+                }
+                const bucketList = await loadBucketsForPlayer(sourceNow, playerKey, startTs, endTs);
                 const bucketsByCoord = new Map();
                 bucketList.forEach((rec) => {
                     const coord = rec.coords || 'unknown';
@@ -2445,7 +2788,10 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
                 setDateOption(dateSelect, todayKey);
             });
         }
-        if (clearPlayer && !clearPlayer.dataset.bound) {
+        if (clearPlayer) {
+            clearPlayer.style.display = REMOTE_HISTORY_ONLY ? 'none' : '';
+        }
+        if (!REMOTE_HISTORY_ONLY && clearPlayer && !clearPlayer.dataset.bound) {
             clearPlayer.dataset.bound = 'true';
             clearPlayer.addEventListener('click', async () => {
                 const playerKey = playerSelect.value;
@@ -2457,7 +2803,7 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
                 if (!ok) {
                     return;
                 }
-                const dbNow = await openDb();
+                const dbNow = await getSource();
                 await deletePlayerData(dbNow, playerKey);
                 playerSelect.value = '';
                 dateSelect.value = '';
@@ -2473,12 +2819,23 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
     }
 
     render();
+    const refreshMs = REMOTE_HISTORY_ONLY ? REMOTE_REFRESH_MS : BUCKET_MS;
     setInterval(() => {
         const dateSelect = document.getElementById('dateSelect');
+        if (REMOTE_HISTORY_ONLY) {
+            ensureRemoteDataset(true).catch((err) => {
+                const root = document.getElementById('root');
+                if (root) {
+                    setRootMessage(root, 'Error sync remoto: ' + (err && err.message ? err.message : 'desconocido'));
+                }
+            });
+        }
         if (dateSelect && dateSelect.value) {
             dateSelect.dispatchEvent(new Event('change'));
+        } else if (REMOTE_HISTORY_ONLY) {
+            render();
         }
-    }, BUCKET_MS);
+    }, refreshMs);
 })();
 <\/script>
 </body>
