@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.24
+// @version      0.7.25
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -39,6 +39,7 @@
     const SCAN_CONTINUOUS_ID = 'ptreLocalScanContinuous';
     const SCAN_STOP_ID = 'ptreLocalScanStop';
     const SYNC_CONFIG_ID = 'ptreLocalSyncConfig';
+    const SYNC_STATUS_ID = 'ptreLocalSyncStatus';
 
     const DB_NAME = 'ptreLocalActivityDB';
     const DB_VERSION = 3;
@@ -109,6 +110,8 @@
     let syncPendingTargets = null;
     let syncLastRemoteUpdatedAt = 0;
     let syncLastRemoteSerialized = '';
+    let syncOnline = false;
+    let syncLastError = '';
 
     function addStyles() {
         GM_addStyle(`
@@ -132,6 +135,16 @@
 }
 #${PANEL_ID} .ptreLocalActions {
     margin-top: 6px;
+}
+#${PANEL_ID} .ptreLocalSyncStatus {
+    margin-top: 4px;
+    color: #ffd166;
+}
+#${PANEL_ID} .ptreLocalSyncStatus.ok {
+    color: #9ccf5f;
+}
+#${PANEL_ID} .ptreLocalSyncStatus.error {
+    color: #ff4d4d;
 }
 #${PANEL_ID} .ptreLocalButton {
     cursor: pointer;
@@ -214,6 +227,7 @@
                 <button id="${OPEN_ID}" class="ptreLocalButton">Abrir historial</button>
                 <button id="${SYNC_CONFIG_ID}" class="ptreLocalButton">Sync: off</button>
             </div>
+            <div id="${SYNC_STATUS_ID}" class="ptreLocalSyncStatus">Sync: off</div>
             <div class="ptreLocalSection">
                 <div class="ptreLocalSectionTitle">Objetivos</div>
                 <select id="${TARGET_SELECT_ID}">
@@ -259,6 +273,7 @@
             syncConfigBtn.addEventListener('click', configureSyncSettings);
         }
         updateSyncButtonLabel();
+        renderSyncStatus();
         const targetSelect = document.getElementById(TARGET_SELECT_ID);
         if (targetSelect && !targetSelect.dataset.bound) {
             targetSelect.dataset.bound = 'true';
@@ -324,6 +339,48 @@
         if (el) {
             el.textContent = message;
         }
+    }
+
+    function renderSyncStatus() {
+        const el = document.getElementById(SYNC_STATUS_ID);
+        if (!el) {
+            return;
+        }
+        let text = 'Sync: off';
+        let kind = '';
+        if (!isSyncEnabled()) {
+            text = 'Sync: off';
+            kind = '';
+        } else if (!isSyncConfigured()) {
+            text = 'Sync: offline (config incompleta)';
+            kind = 'error';
+        } else if (syncOnline) {
+            text = 'Sync: online';
+            kind = 'ok';
+        } else if (syncLastError) {
+            text = 'Sync: offline (' + syncLastError + ')';
+            kind = 'error';
+        } else {
+            text = 'Sync: offline';
+            kind = 'error';
+        }
+        el.textContent = text;
+        el.classList.remove('ok', 'error');
+        if (kind) {
+            el.classList.add(kind);
+        }
+    }
+
+    function setSyncOnline() {
+        syncOnline = true;
+        syncLastError = '';
+        renderSyncStatus();
+    }
+
+    function setSyncOffline(reason) {
+        syncOnline = false;
+        syncLastError = reason ? String(reason) : '';
+        renderSyncStatus();
     }
 
     function normalizeSyncMode(value) {
@@ -404,13 +461,21 @@
                     timeout: SYNC_HTTP_TIMEOUT_MS,
                     onload: (res) => {
                         if (res.status < 200 || res.status >= 300) {
+                            setSyncOffline('http ' + res.status);
                             reject(new Error('sync http ' + res.status));
                             return;
                         }
+                        setSyncOnline();
                         resolve(parseJsonSafe(res.responseText || ''));
                     },
-                    onerror: () => reject(new Error('sync network error')),
-                    ontimeout: () => reject(new Error('sync timeout'))
+                    onerror: () => {
+                        setSyncOffline('network');
+                        reject(new Error('sync network error'));
+                    },
+                    ontimeout: () => {
+                        setSyncOffline('timeout');
+                        reject(new Error('sync timeout'));
+                    }
                 });
                 return;
             }
@@ -424,13 +489,20 @@
             fetch(syncEndpoint, init)
                 .then(async (res) => {
                     if (!res.ok) {
+                        setSyncOffline('http ' + res.status);
                         throw new Error('sync http ' + res.status);
                     }
                     const text = await res.text();
+                    setSyncOnline();
                     return parseJsonSafe(text);
                 })
                 .then(resolve)
-                .catch(reject);
+                .catch((err) => {
+                    if (!syncLastError) {
+                        setSyncOffline('network');
+                    }
+                    reject(err);
+                });
         });
     }
 
@@ -532,12 +604,15 @@
 
     function startTargetsSync() {
         if (!isSyncEnabled()) {
+            setSyncOffline('');
             return;
         }
         if (!isSyncConfigured()) {
             console.warn('[PTRE sync] mode enabled but syncEndpoint is not valid');
+            setSyncOffline('config incompleta');
             return;
         }
+        setSyncOffline('');
         if (isSyncHost()) {
             queueHostTargetsSync(loadTargets());
             return;
@@ -566,6 +641,7 @@
         syncPendingTargets = null;
         syncLastRemoteUpdatedAt = 0;
         syncLastRemoteSerialized = '';
+        setSyncOffline('');
     }
 
     function restartTargetsSync() {
@@ -579,6 +655,7 @@
             return;
         }
         btn.textContent = 'Sync: ' + syncMode;
+        renderSyncStatus();
     }
 
     function configureSyncSettings() {
