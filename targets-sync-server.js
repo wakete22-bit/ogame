@@ -88,6 +88,26 @@ function normalizeCoordList(input) {
     return Array.from(set);
 }
 
+function compareCoords(a, b) {
+    const pa = String(a || '').split(':').map((part) => Number(part));
+    const pb = String(b || '').split(':').map((part) => Number(part));
+    if (pa.length !== 3 || pb.length !== 3) {
+        return String(a || '').localeCompare(String(b || ''));
+    }
+    for (let i = 0; i < 3; i += 1) {
+        const na = Number.isFinite(pa[i]) ? pa[i] : 0;
+        const nb = Number.isFinite(pb[i]) ? pb[i] : 0;
+        if (na !== nb) {
+            return na - nb;
+        }
+    }
+    return 0;
+}
+
+function sortCoordList(input) {
+    return normalizeCoordList(input).sort(compareCoords);
+}
+
 function normalizeControl(input) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
         return null;
@@ -221,6 +241,83 @@ function normalizeActivityBatch(input) {
     return list;
 }
 
+function normalizeSharedCoordObservation(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        return null;
+    }
+    const playerKey = String(input.playerKey || '').trim();
+    const coords = normalizeCoord(input.coords);
+    const seenAt = safeNumber(input.seenAt, 0);
+    if (!playerKey || !coords || seenAt <= 0) {
+        return null;
+    }
+    return {
+        playerKey: playerKey,
+        playerName: String(input.playerName || playerKey).trim() || playerKey,
+        coords: coords,
+        seenAt: seenAt
+    };
+}
+
+function normalizeSharedCoordsBatch(input) {
+    if (!Array.isArray(input)) {
+        return [];
+    }
+    const list = [];
+    input.forEach((item) => {
+        const obs = normalizeSharedCoordObservation(item);
+        if (obs) {
+            list.push(obs);
+        }
+    });
+    return list;
+}
+
+function normalizeSharedCoordsState(input) {
+    const normalized = {};
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        return normalized;
+    }
+    Object.keys(input).forEach((playerKeyRaw) => {
+        const rec = input[playerKeyRaw];
+        if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
+            return;
+        }
+        const playerKey = String(rec.playerKey || playerKeyRaw || '').trim();
+        if (!playerKey) {
+            return;
+        }
+        const coords = sortCoordList(rec.coords);
+        if (!coords.length) {
+            return;
+        }
+        normalized[playerKey] = {
+            playerKey: playerKey,
+            playerName: String(rec.playerName || playerKey).trim() || playerKey,
+            lastSeen: safeNumber(rec.lastSeen, 0),
+            coords: coords
+        };
+    });
+    return normalized;
+}
+
+function mergeSharedCoordsBatch(sharedCoords, batch) {
+    const merged = normalizeSharedCoordsState(sharedCoords);
+    batch.forEach((obs) => {
+        const existing = merged[obs.playerKey] || {
+            playerKey: obs.playerKey,
+            playerName: obs.playerName || obs.playerKey,
+            lastSeen: 0,
+            coords: []
+        };
+        existing.playerName = obs.playerName || existing.playerName || existing.playerKey;
+        existing.lastSeen = Math.max(safeNumber(existing.lastSeen, 0), obs.seenAt);
+        existing.coords = sortCoordList((existing.coords || []).concat([obs.coords]));
+        merged[obs.playerKey] = existing;
+    });
+    return merged;
+}
+
 function normalizeActivityState(input) {
     const normalized = { players: {}, buckets: {} };
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -352,6 +449,55 @@ function mergeActivityBatch(activity, batch) {
     return merged;
 }
 
+function buildSharedCoordsFromActivity(activity) {
+    const shared = {};
+    if (!activity || typeof activity !== 'object' || Array.isArray(activity)) {
+        return shared;
+    }
+    const rawBuckets = activity.buckets;
+    if (!rawBuckets || typeof rawBuckets !== 'object' || Array.isArray(rawBuckets)) {
+        return shared;
+    }
+    Object.keys(rawBuckets).forEach((idKey) => {
+        const rec = rawBuckets[idKey];
+        if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
+            return;
+        }
+        const playerKey = String(rec.playerKey || '').trim();
+        const coord = normalizeCoord(rec.coords);
+        if (!playerKey || !coord) {
+            return;
+        }
+        if (!shared[playerKey]) {
+            shared[playerKey] = [];
+        }
+        shared[playerKey].push(coord);
+    });
+    Object.keys(shared).forEach((playerKey) => {
+        shared[playerKey] = sortCoordList(shared[playerKey]);
+        if (!shared[playerKey].length) {
+            delete shared[playerKey];
+        }
+    });
+    return shared;
+}
+
+function buildPublicSharedCoords() {
+    const shared = {};
+    const fromState = normalizeSharedCoordsState(state.sharedCoords);
+    Object.keys(fromState).forEach((playerKey) => {
+        shared[playerKey] = sortCoordList(fromState[playerKey].coords);
+    });
+    const fromActivity = buildSharedCoordsFromActivity(state.activity);
+    Object.keys(fromActivity).forEach((playerKey) => {
+        const merged = sortCoordList((shared[playerKey] || []).concat(fromActivity[playerKey] || []));
+        if (merged.length) {
+            shared[playerKey] = merged;
+        }
+    });
+    return shared;
+}
+
 function createEmptyState() {
     return {
         targets: {},
@@ -360,6 +506,8 @@ function createEmptyState() {
         controlUpdatedAt: 0,
         activity: { players: {}, buckets: {} },
         activityUpdatedAt: 0,
+        sharedCoords: {},
+        sharedCoordsUpdatedAt: 0,
         editLock: null
     };
 }
@@ -381,6 +529,8 @@ function loadState() {
         base.controlUpdatedAt = safeNumber(parsed.controlUpdatedAt, 0);
         base.activity = normalizeActivityState(parsed.activity);
         base.activityUpdatedAt = safeNumber(parsed.activityUpdatedAt, 0);
+        base.sharedCoords = normalizeSharedCoordsState(parsed.sharedCoords);
+        base.sharedCoordsUpdatedAt = safeNumber(parsed.sharedCoordsUpdatedAt, 0);
         base.editLock = normalizeEditLock(parsed.editLock);
         return base;
     } catch (err) {
@@ -495,7 +645,9 @@ function buildPublicState(includeActivity) {
         updatedAt: state.updatedAt,
         control: state.control,
         controlUpdatedAt: state.controlUpdatedAt,
-        editLock: getPublicEditLock(now)
+        editLock: getPublicEditLock(now),
+        sharedCoords: buildPublicSharedCoords(),
+        sharedCoordsUpdatedAt: Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), safeNumber(state.activityUpdatedAt, 0))
     };
     if (includeActivity) {
         payload.activity = state.activity;
@@ -576,6 +728,14 @@ function parseUpdatePayload(payload) {
         }
     }
 
+    if (Object.prototype.hasOwnProperty.call(payload, 'coordsBatch')) {
+        const batch = normalizeSharedCoordsBatch(payload.coordsBatch);
+        if (batch.length > 0) {
+            update.coordsBatch = batch;
+            update.coordsUpdatedAt = safeNumber(payload.coordsUpdatedAt, Date.now());
+        }
+    }
+
     if (Object.prototype.hasOwnProperty.call(payload, 'editLockCommand')) {
         const command = normalizeEditLockCommand(payload.editLockCommand);
         if (command) {
@@ -643,6 +803,11 @@ const server = http.createServer(async (req, res) => {
         if (Object.prototype.hasOwnProperty.call(update, 'activityBatch')) {
             state.activity = mergeActivityBatch(state.activity, update.activityBatch);
             state.activityUpdatedAt = update.activityUpdatedAt;
+            stateChanged = true;
+        }
+        if (Object.prototype.hasOwnProperty.call(update, 'coordsBatch')) {
+            state.sharedCoords = mergeSharedCoordsBatch(state.sharedCoords, update.coordsBatch);
+            state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), update.coordsUpdatedAt);
             stateChanged = true;
         }
         if (Object.prototype.hasOwnProperty.call(update, 'editLockCommand')) {

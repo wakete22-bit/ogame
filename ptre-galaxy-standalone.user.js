@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.33
+// @version      0.7.34
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -78,6 +78,9 @@
     const SYNC_ACTIVITY_PUSH_DEBOUNCE_MS = 1000;
     const SYNC_ACTIVITY_BATCH_SIZE = 80;
     const SYNC_ACTIVITY_MAX_QUEUE = 1000;
+    const SYNC_COORDS_PUSH_DEBOUNCE_MS = 1000;
+    const SYNC_COORDS_BATCH_SIZE = 120;
+    const SYNC_COORDS_MAX_QUEUE = 1500;
     const SYNC_EDIT_LOCK_TTL_MS = 2 * 60 * 1000;
     const SYNC_EDIT_LOCK_HEARTBEAT_MS = 45 * 1000;
     const SYNC_HTTP_TIMEOUT_MS = 10000;
@@ -150,8 +153,14 @@
     let syncActivityPushTimer = null;
     let syncActivityPushInFlight = false;
     let syncPendingActivity = [];
+    let syncCoordsPushTimer = null;
+    let syncCoordsPushInFlight = false;
+    let syncPendingCoords = [];
     let syncLastRemoteUpdatedAt = 0;
     let syncLastRemoteSerialized = '';
+    let syncRemoteCoordsByPlayer = {};
+    let syncRemoteCoordsUpdatedAt = 0;
+    let syncRemoteCoordsSerialized = '';
     let syncOnline = false;
     let syncLastError = '';
     let syncRemoteEditLock = null;
@@ -709,6 +718,29 @@
         return Array.from(set);
     }
 
+    function compareCoords(a, b) {
+        const pa = String(a || '').split(':').map((part) => Number(part));
+        const pb = String(b || '').split(':').map((part) => Number(part));
+        if (pa.length !== 3 || pb.length !== 3) {
+            return String(a || '').localeCompare(String(b || ''));
+        }
+        for (let i = 0; i < 3; i += 1) {
+            const na = Number.isFinite(pa[i]) ? pa[i] : 0;
+            const nb = Number.isFinite(pb[i]) ? pb[i] : 0;
+            if (na !== nb) {
+                return na - nb;
+            }
+        }
+        return 0;
+    }
+
+    function mergeCoordLists(localCoords, remoteCoords) {
+        const set = new Set();
+        normalizeCoordList(localCoords).forEach((coord) => set.add(coord));
+        normalizeCoordList(remoteCoords).forEach((coord) => set.add(coord));
+        return Array.from(set).sort(compareCoords);
+    }
+
     function normalizeRemoteScanPlan(plan) {
         if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
             return null;
@@ -797,6 +829,24 @@
             debris: normalizeDebrisValue(obs.debris),
             seenAt: seenAt,
             bucketTs: bucketTs
+        };
+    }
+
+    function normalizeSharedCoordObservation(obs) {
+        if (!obs || typeof obs !== 'object' || Array.isArray(obs)) {
+            return null;
+        }
+        const playerKey = String(obs.playerKey || '').trim();
+        const coords = normalizeCoord(obs.coords);
+        const seenAt = Number(obs.seenAt);
+        if (!playerKey || !coords || !Number.isFinite(seenAt) || seenAt <= 0) {
+            return null;
+        }
+        return {
+            playerKey: playerKey,
+            playerName: String(obs.playerName || '').trim() || playerKey,
+            coords: coords,
+            seenAt: seenAt
         };
     }
 
@@ -1040,6 +1090,74 @@
         };
     }
 
+    function normalizeSharedCoordsMap(input) {
+        const normalized = {};
+        if (!input || typeof input !== 'object' || Array.isArray(input)) {
+            return normalized;
+        }
+        Object.keys(input).forEach((playerKey) => {
+            const key = String(playerKey || '').trim();
+            if (!key) {
+                return;
+            }
+            const coords = normalizeCoordList(input[playerKey]).sort(compareCoords);
+            if (!coords.length) {
+                return;
+            }
+            normalized[key] = coords;
+        });
+        return normalized;
+    }
+
+    function parseRemoteSharedCoordsPayload(payload) {
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            return null;
+        }
+        const rawCoords = payload.sharedCoords;
+        if (!rawCoords || typeof rawCoords !== 'object' || Array.isArray(rawCoords)) {
+            return null;
+        }
+        const updatedAtRaw = Number(payload.sharedCoordsUpdatedAt || payload.activityUpdatedAt || 0);
+        const updatedAt = Number.isFinite(updatedAtRaw) ? updatedAtRaw : 0;
+        return {
+            coordsByPlayer: normalizeSharedCoordsMap(rawCoords),
+            updatedAt: updatedAt
+        };
+    }
+
+    function applyRemoteSharedCoordsFromPayload(payload, force, onApplied) {
+        const remote = parseRemoteSharedCoordsPayload(payload);
+        if (!remote) {
+            return false;
+        }
+        const remoteSerialized = JSON.stringify(remote.coordsByPlayer);
+        const hasChange = Boolean(force)
+            || remote.updatedAt > syncRemoteCoordsUpdatedAt
+            || remoteSerialized !== syncRemoteCoordsSerialized;
+        if (!hasChange) {
+            return false;
+        }
+        syncRemoteCoordsByPlayer = remote.coordsByPlayer;
+        syncRemoteCoordsUpdatedAt = remote.updatedAt;
+        syncRemoteCoordsSerialized = remoteSerialized;
+        if (typeof onApplied === 'function') {
+            onApplied();
+        }
+        return true;
+    }
+
+    function getSharedCoordsForPlayer(playerKey) {
+        const key = String(playerKey || '').trim();
+        if (!key) {
+            return [];
+        }
+        const coords = syncRemoteCoordsByPlayer[key];
+        if (!Array.isArray(coords)) {
+            return [];
+        }
+        return normalizeCoordList(coords).sort(compareCoords);
+    }
+
     function applyRemoteTargetsFromPayload(payload, force, onApplied) {
         const remote = parseRemoteTargetsPayload(payload);
         if (!remote) {
@@ -1084,6 +1202,7 @@
             }
         }).then((payload) => {
             applyRemoteTargetsFromPayload(payload, false, null);
+            applyRemoteSharedCoordsFromPayload(payload, false, null);
             updateRemoteEditLockFromPayload(payload);
             const result = payload && typeof payload.lockResult === 'object' ? payload.lockResult : { ok: false, reason: 'unknown' };
             if (isLocalEditorLockOwner()) {
@@ -1164,6 +1283,7 @@
             targets: targetsToSend,
             updatedAt: Date.now()
         }).then((payload) => {
+            applyRemoteSharedCoordsFromPayload(payload, false, null);
             updateRemoteEditLockFromPayload(payload);
         }).catch((err) => {
             console.warn('[PTRE sync host] push failed:', err);
@@ -1235,6 +1355,80 @@
                     syncActivityPushTimer = null;
                     flushSlaveActivitySync();
                 }, SYNC_ACTIVITY_PUSH_DEBOUNCE_MS);
+            }
+        });
+    }
+
+    function queueSharedCoordsSync(obs) {
+        if (!isSyncEnabled() || !isSyncConfigured()) {
+            return;
+        }
+        const normalized = normalizeSharedCoordObservation(obs);
+        if (!normalized) {
+            return;
+        }
+        syncPendingCoords.push(normalized);
+        if (syncPendingCoords.length > SYNC_COORDS_MAX_QUEUE) {
+            syncPendingCoords.splice(0, syncPendingCoords.length - SYNC_COORDS_MAX_QUEUE);
+        }
+        if (syncCoordsPushTimer) {
+            return;
+        }
+        syncCoordsPushTimer = setTimeout(() => {
+            syncCoordsPushTimer = null;
+            flushSharedCoordsSync();
+        }, SYNC_COORDS_PUSH_DEBOUNCE_MS);
+    }
+
+    function flushSharedCoordsSync() {
+        if (!isSyncEnabled() || !isSyncConfigured() || syncPendingCoords.length === 0) {
+            return;
+        }
+        if (syncCoordsPushInFlight) {
+            if (!syncCoordsPushTimer) {
+                syncCoordsPushTimer = setTimeout(() => {
+                    syncCoordsPushTimer = null;
+                    flushSharedCoordsSync();
+                }, SYNC_COORDS_PUSH_DEBOUNCE_MS);
+            }
+            return;
+        }
+        const rawBatch = syncPendingCoords.splice(0, SYNC_COORDS_BATCH_SIZE);
+        if (rawBatch.length === 0) {
+            return;
+        }
+        const dedup = new Map();
+        rawBatch.forEach((item) => {
+            const key = item.playerKey + '|' + item.coords;
+            const current = dedup.get(key);
+            if (!current || item.seenAt >= current.seenAt) {
+                dedup.set(key, item);
+            }
+        });
+        const batch = Array.from(dedup.values());
+        if (batch.length === 0) {
+            return;
+        }
+        syncCoordsPushInFlight = true;
+        requestSyncJson('PUT', {
+            coordsBatch: batch,
+            coordsUpdatedAt: Date.now()
+        }).then((payload) => {
+            applyRemoteSharedCoordsFromPayload(payload, false, null);
+            updateRemoteEditLockFromPayload(payload);
+        }).catch((err) => {
+            console.warn('[PTRE sync] coords push failed:', err);
+            syncPendingCoords = batch.concat(syncPendingCoords);
+            if (syncPendingCoords.length > SYNC_COORDS_MAX_QUEUE) {
+                syncPendingCoords = syncPendingCoords.slice(syncPendingCoords.length - SYNC_COORDS_MAX_QUEUE);
+            }
+        }).finally(() => {
+            syncCoordsPushInFlight = false;
+            if (syncPendingCoords.length > 0 && !syncCoordsPushTimer) {
+                syncCoordsPushTimer = setTimeout(() => {
+                    syncCoordsPushTimer = null;
+                    flushSharedCoordsSync();
+                }, SYNC_COORDS_PUSH_DEBOUNCE_MS);
             }
         });
     }
@@ -1370,6 +1564,12 @@
             applyRemoteTargetsFromPayload(payload, force, () => {
                 setStatus('Sync: objetivos actualizados');
             });
+            applyRemoteSharedCoordsFromPayload(payload, force, () => {
+                const targetSelect = document.getElementById(TARGET_SELECT_ID);
+                if (targetSelect && targetSelect.value) {
+                    showCoordsForPlayer(targetSelect.value);
+                }
+            });
             updateRemoteEditLockFromPayload(payload);
             if (isLocalEditorLockOwner()) {
                 startEditLockHeartbeat();
@@ -1431,15 +1631,24 @@
             clearTimeout(syncActivityPushTimer);
             syncActivityPushTimer = null;
         }
+        if (syncCoordsPushTimer) {
+            clearTimeout(syncCoordsPushTimer);
+            syncCoordsPushTimer = null;
+        }
         stopEditLockHeartbeat();
         syncEditLockClaimInFlight = false;
         syncPullInFlight = false;
         syncPushInFlight = false;
         syncActivityPushInFlight = false;
+        syncCoordsPushInFlight = false;
         syncPendingTargets = null;
         syncPendingActivity = [];
+        syncPendingCoords = [];
         syncLastRemoteUpdatedAt = 0;
         syncLastRemoteSerialized = '';
+        syncRemoteCoordsByPlayer = {};
+        syncRemoteCoordsUpdatedAt = 0;
+        syncRemoteCoordsSerialized = '';
         syncRemoteEditLock = null;
         setSyncOffline('');
         refreshExecuteSlaveToggle();
@@ -2001,13 +2210,7 @@
                     coords.forEach((c) => set.add(c));
                 });
                 const arr = Array.from(set);
-                arr.sort((a, b) => {
-                    const [ga, sa, pa] = a.split(':').map(Number);
-                    const [gb, sb, pb] = b.split(':').map(Number);
-                    if (ga !== gb) return ga - gb;
-                    if (sa !== sb) return sa - sb;
-                    return pa - pb;
-                });
+                arr.sort(compareCoords);
                 return arr;
             });
     }
@@ -2264,7 +2467,7 @@
         });
     }
 
-    function getCoordsForPlayer(playerKey) {
+    function getLocalCoordsForPlayer(playerKey) {
         return openDb().then((db) => new Promise((resolve, reject) => {
             const tx = db.transaction([STORE_BUCKETS], 'readonly');
             const store = tx.objectStore(STORE_BUCKETS);
@@ -2274,7 +2477,7 @@
             req.onsuccess = () => {
                 const cursor = req.result;
                 if (!cursor) {
-                    resolve(Array.from(coords).filter((c) => c && c !== 'unknown').sort());
+                    resolve(Array.from(coords).filter((c) => c && c !== 'unknown').sort(compareCoords));
                     return;
                 }
                 const val = cursor.value;
@@ -2285,6 +2488,13 @@
             };
             req.onerror = () => reject(req.error);
         }));
+    }
+
+    function getCoordsForPlayer(playerKey) {
+        const remoteCoords = getSharedCoordsForPlayer(playerKey);
+        return getLocalCoordsForPlayer(playerKey)
+            .then((localCoords) => mergeCoordLists(localCoords, remoteCoords))
+            .catch(() => remoteCoords.slice().sort(compareCoords));
     }
 
     function goToCoords(coord) {
@@ -2525,6 +2735,7 @@
 
     function queueObservation(obs) {
         queueSlaveActivitySync(obs);
+        queueSharedCoordsSync(obs);
         dbQueue = dbQueue.then(() => recordObservation(obs)).catch((err) => {
             console.log('[PTRE Local] DB error', err);
             setStatus('DB error');
