@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.22
+// @version      0.7.24
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -78,10 +78,6 @@
     const isIngameRoot = /page=ingame/.test(location.search || '') && !isGalaxy;
     if (isIngameRoot) {
         initIngameAutoGalaxy();
-        return;
-    }
-    if (!isGalaxy) {
-        return;
     }
 
     let lastGalaxy = null;
@@ -2141,7 +2137,12 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
     }
 
     ensurePanel();
+    updateTargetPanel();
     startTargetsSync();
-    waitForGalaxyToBeLoaded();
-    watchGalaxyChanges();
+    if (isGalaxy) {
+        waitForGalaxyToBeLoaded();
+        watchGalaxyChanges();
+    } else {
+        setStatus('Panel activo (fuera de Galaxia)');
+    }
 })();
