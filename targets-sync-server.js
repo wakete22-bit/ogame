@@ -10,6 +10,9 @@ const PORT = Number(process.env.PORT || 8787);
 const SYNC_TOKEN = process.env.SYNC_TOKEN || '';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'targets-store.json');
 const MAX_BODY_BYTES = 1024 * 1024;
+const EDIT_LOCK_DEFAULT_TTL_MS = 2 * 60 * 1000;
+const EDIT_LOCK_MIN_TTL_MS = 30 * 1000;
+const EDIT_LOCK_MAX_TTL_MS = 15 * 60 * 1000;
 
 function safeNumber(value, fallback) {
     const num = Number(value);
@@ -105,6 +108,59 @@ function normalizeControl(input) {
         queue: normalizeCoordList(input.queue),
         scanDelayMs: safeNumber(input.scanDelayMs, 1000),
         continuousIntervalMs: safeNumber(input.continuousIntervalMs, 60000)
+    };
+}
+
+function clampLockTtl(value) {
+    const ttl = safeNumber(value, EDIT_LOCK_DEFAULT_TTL_MS);
+    return Math.min(EDIT_LOCK_MAX_TTL_MS, Math.max(EDIT_LOCK_MIN_TTL_MS, ttl));
+}
+
+function normalizeEditLockCommand(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        return null;
+    }
+    const action = String(input.action || '').toLowerCase();
+    if (action !== 'acquire' && action !== 'release' && action !== 'heartbeat') {
+        return null;
+    }
+    const ownerId = String(input.ownerId || '').trim();
+    if (!ownerId) {
+        return null;
+    }
+    const token = String(input.token || '').trim();
+    if (!token) {
+        return null;
+    }
+    const ownerLabelRaw = String(input.ownerLabel || '').trim();
+    const ownerLabel = ownerLabelRaw || ownerId;
+    return {
+        action: action,
+        ownerId: ownerId,
+        ownerLabel: ownerLabel,
+        token: token,
+        ttlMs: clampLockTtl(input.ttlMs),
+        now: safeNumber(input.now, Date.now())
+    };
+}
+
+function normalizeEditLock(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        return null;
+    }
+    const ownerId = String(input.ownerId || '').trim();
+    const token = String(input.token || '').trim();
+    const expiresAt = safeNumber(input.expiresAt, 0);
+    if (!ownerId || !token || expiresAt <= 0) {
+        return null;
+    }
+    const ownerLabelRaw = String(input.ownerLabel || '').trim();
+    return {
+        ownerId: ownerId,
+        ownerLabel: ownerLabelRaw || ownerId,
+        token: token,
+        expiresAt: expiresAt,
+        updatedAt: safeNumber(input.updatedAt, 0)
     };
 }
 
@@ -302,7 +358,8 @@ function createEmptyState() {
         control: null,
         controlUpdatedAt: 0,
         activity: { players: {}, buckets: {} },
-        activityUpdatedAt: 0
+        activityUpdatedAt: 0,
+        editLock: null
     };
 }
 
@@ -323,6 +380,7 @@ function loadState() {
         base.controlUpdatedAt = safeNumber(parsed.controlUpdatedAt, 0);
         base.activity = normalizeActivityState(parsed.activity);
         base.activityUpdatedAt = safeNumber(parsed.activityUpdatedAt, 0);
+        base.editLock = normalizeEditLock(parsed.editLock);
         return base;
     } catch (err) {
         console.warn('[targets-sync-server] failed to load state:', err.message);
@@ -338,12 +396,114 @@ function persistState() {
     fs.renameSync(tmpFile, DATA_FILE);
 }
 
+function cleanupExpiredLock(now) {
+    if (!state.editLock) {
+        return false;
+    }
+    if (safeNumber(state.editLock.expiresAt, 0) > now) {
+        return false;
+    }
+    state.editLock = null;
+    return true;
+}
+
+function getPublicEditLock(now) {
+    cleanupExpiredLock(now);
+    if (!state.editLock) {
+        return null;
+    }
+    return {
+        ownerId: state.editLock.ownerId,
+        ownerLabel: state.editLock.ownerLabel,
+        expiresAt: state.editLock.expiresAt,
+        updatedAt: state.editLock.updatedAt
+    };
+}
+
+function applyEditLockCommand(command) {
+    const now = safeNumber(command.now, Date.now());
+    cleanupExpiredLock(now);
+    const current = state.editLock;
+
+    if (command.action === 'acquire') {
+        if (current && current.ownerId !== command.ownerId) {
+            return {
+                ok: false,
+                reason: 'occupied',
+                ownerId: current.ownerId,
+                ownerLabel: current.ownerLabel,
+                expiresAt: current.expiresAt
+            };
+        }
+        state.editLock = {
+            ownerId: command.ownerId,
+            ownerLabel: command.ownerLabel || command.ownerId,
+            token: command.token,
+            expiresAt: now + clampLockTtl(command.ttlMs),
+            updatedAt: now
+        };
+        return {
+            ok: true,
+            action: 'acquire',
+            ownerId: state.editLock.ownerId,
+            ownerLabel: state.editLock.ownerLabel,
+            expiresAt: state.editLock.expiresAt
+        };
+    }
+
+    if (command.action === 'heartbeat') {
+        if (!current) {
+            return { ok: false, reason: 'no_lock' };
+        }
+        if (current.ownerId !== command.ownerId || current.token !== command.token) {
+            return {
+                ok: false,
+                reason: 'forbidden',
+                ownerId: current.ownerId,
+                ownerLabel: current.ownerLabel,
+                expiresAt: current.expiresAt
+            };
+        }
+        current.ownerLabel = command.ownerLabel || current.ownerLabel || current.ownerId;
+        current.expiresAt = now + clampLockTtl(command.ttlMs);
+        current.updatedAt = now;
+        return {
+            ok: true,
+            action: 'heartbeat',
+            ownerId: current.ownerId,
+            ownerLabel: current.ownerLabel,
+            expiresAt: current.expiresAt
+        };
+    }
+
+    if (command.action === 'release') {
+        if (!current) {
+            return { ok: true, action: 'release', released: false };
+        }
+        if (current.ownerId !== command.ownerId || current.token !== command.token) {
+            return {
+                ok: false,
+                reason: 'forbidden',
+                ownerId: current.ownerId,
+                ownerLabel: current.ownerLabel,
+                expiresAt: current.expiresAt
+            };
+        }
+        state.editLock = null;
+        return { ok: true, action: 'release', released: true };
+    }
+
+    return { ok: false, reason: 'invalid_action' };
+}
+
 function buildPublicState(includeActivity) {
+    const now = Date.now();
     const payload = {
         targets: state.targets,
         updatedAt: state.updatedAt,
         control: state.control,
-        controlUpdatedAt: state.controlUpdatedAt
+        controlUpdatedAt: state.controlUpdatedAt,
+        editLock: getPublicEditLock(now)
     };
     if (includeActivity) {
         payload.activity = state.activity;
@@ -424,6 +584,13 @@ function parseUpdatePayload(payload) {
         }
     }
 
+    if (Object.prototype.hasOwnProperty.call(payload, 'editLockCommand')) {
+        const command = normalizeEditLockCommand(payload.editLockCommand);
+        if (command) {
+            update.editLockCommand = command;
+        }
+    }
+
     if (!Object.keys(update).length) {
         return null;
     }
@@ -431,6 +598,8 @@ function parseUpdatePayload(payload) {
 }
 
 const server = http.createServer(async (req, res) => {
+    cleanupExpiredLock(Date.now());
+
     if (req.method === 'OPTIONS') {
         sendJson(res, 204, {});
         return;
@@ -467,20 +636,39 @@ const server = http.createServer(async (req, res) => {
             sendJson(res, 400, { error: 'invalid payload' });
             return;
         }
+        let stateChanged = false;
+        let lockResult = null;
         if (Object.prototype.hasOwnProperty.call(update, 'targets')) {
             state.targets = update.targets;
             state.updatedAt = update.updatedAt;
+            stateChanged = true;
         }
         if (Object.prototype.hasOwnProperty.call(update, 'control')) {
             state.control = update.control;
             state.controlUpdatedAt = update.controlUpdatedAt;
+            stateChanged = true;
         }
         if (Object.prototype.hasOwnProperty.call(update, 'activityBatch')) {
             state.activity = mergeActivityBatch(state.activity, update.activityBatch);
             state.activityUpdatedAt = update.activityUpdatedAt;
+            stateChanged = true;
         }
-        persistState();
-        sendJson(res, 200, buildPublicState(false));
+        if (Object.prototype.hasOwnProperty.call(update, 'editLockCommand')) {
+            const beforeLock = state.editLock ? JSON.stringify(state.editLock) : '';
+            lockResult = applyEditLockCommand(update.editLockCommand);
+            const afterLock = state.editLock ? JSON.stringify(state.editLock) : '';
+            if (beforeLock !== afterLock) {
+                stateChanged = true;
+            }
+        }
+        if (stateChanged) {
+            persistState();
+        }
+        const response = buildPublicState(false);
+        if (lockResult) {
+            response.lockResult = lockResult;
+        }
+        sendJson(res, 200, response);
     } catch (err) {
         sendJson(res, 400, { error: err.message || 'bad request' });
     }

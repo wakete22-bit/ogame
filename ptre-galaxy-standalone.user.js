@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.30
+// @version      0.7.31
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -35,6 +35,8 @@
     const KEY_SYNC_MODE = 'ptreLocalSyncMode';
     const KEY_SYNC_ENDPOINT = 'ptreLocalSyncEndpoint';
     const KEY_SYNC_TOKEN = 'ptreLocalSyncToken';
+    const KEY_SYNC_ACTOR_ID = 'ptreLocalSyncActorId';
+    const KEY_SYNC_EDITOR_TOKEN = 'ptreLocalSyncEditorToken';
     const SCAN_SPEED_ID = 'ptreLocalScanSpeed';
     const CONTINUOUS_INTERVAL_ID = 'ptreLocalContinuousInterval';
     const SCAN_START_ID = 'ptreLocalScanStart';
@@ -43,6 +45,9 @@
     const SYNC_CONFIG_ID = 'ptreLocalSyncConfig';
     const SYNC_STATUS_ID = 'ptreLocalSyncStatus';
     const EXECUTE_SLAVE_ID = 'ptreLocalExecuteOnSlave';
+    const EDIT_LOCK_STATUS_ID = 'ptreLocalEditLockStatus';
+    const EDIT_LOCK_TAKE_ID = 'ptreLocalEditLockTake';
+    const EDIT_LOCK_RELEASE_ID = 'ptreLocalEditLockRelease';
 
     const DB_NAME = 'ptreLocalActivityDB';
     const DB_VERSION = 3;
@@ -73,6 +78,8 @@
     const SYNC_ACTIVITY_PUSH_DEBOUNCE_MS = 1000;
     const SYNC_ACTIVITY_BATCH_SIZE = 80;
     const SYNC_ACTIVITY_MAX_QUEUE = 1000;
+    const SYNC_EDIT_LOCK_TTL_MS = 2 * 60 * 1000;
+    const SYNC_EDIT_LOCK_HEARTBEAT_MS = 45 * 1000;
     const SYNC_HTTP_TIMEOUT_MS = 10000;
     const SYNC_TOKEN_HEADER = 'x-ptre-token';
     const HISTORY_BRIDGE_REQUEST = 'ptreLocalHistoryRemoteRequest';
@@ -90,6 +97,11 @@
     const shouldAutoOpenGalaxy = Boolean(GM_getValue(KEY_CONTINUOUS_ACTIVE, false));
     if (isIngameRoot && shouldAutoOpenGalaxy) {
         initIngameAutoGalaxy();
+    }
+
+    function generateLocalId(prefix) {
+        const p = String(prefix || 'id');
+        return p + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
     }
 
     let lastGalaxy = null;
@@ -117,6 +129,16 @@
     let syncMode = normalizeSyncMode(String(GM_getValue(KEY_SYNC_MODE, DEFAULT_SYNC_MODE) || DEFAULT_SYNC_MODE));
     let syncEndpoint = String(GM_getValue(KEY_SYNC_ENDPOINT, DEFAULT_SYNC_ENDPOINT) || DEFAULT_SYNC_ENDPOINT).trim();
     let syncToken = String(GM_getValue(KEY_SYNC_TOKEN, DEFAULT_SYNC_TOKEN) || DEFAULT_SYNC_TOKEN).trim();
+    let syncActorId = String(GM_getValue(KEY_SYNC_ACTOR_ID, '') || '').trim();
+    if (!syncActorId) {
+        syncActorId = generateLocalId('ptre-actor');
+        GM_setValue(KEY_SYNC_ACTOR_ID, syncActorId);
+    }
+    let syncEditorToken = String(GM_getValue(KEY_SYNC_EDITOR_TOKEN, '') || '').trim();
+    if (!syncEditorToken) {
+        syncEditorToken = generateLocalId('ptre-lock');
+        GM_setValue(KEY_SYNC_EDITOR_TOKEN, syncEditorToken);
+    }
     let syncPullTimer = null;
     let syncPullInFlight = false;
     let syncPushTimer = null;
@@ -129,6 +151,8 @@
     let syncLastRemoteSerialized = '';
     let syncOnline = false;
     let syncLastError = '';
+    let syncRemoteEditLock = null;
+    let syncEditLockHeartbeatTimer = null;
     let historyBridgeBound = false;
 
     function addStyles() {
@@ -162,6 +186,16 @@
     color: #9ccf5f;
 }
 #${PANEL_ID} .ptreLocalSyncStatus.error {
+    color: #ff4d4d;
+}
+#${PANEL_ID} .ptreLocalEditStatus {
+    margin-top: 4px;
+    color: #ffd166;
+}
+#${PANEL_ID} .ptreLocalEditStatus.ok {
+    color: #9ccf5f;
+}
+#${PANEL_ID} .ptreLocalEditStatus.error {
     color: #ff4d4d;
 }
 #${PANEL_ID} .ptreLocalButton {
@@ -258,6 +292,11 @@
                 <button id="${SYNC_CONFIG_ID}" class="ptreLocalButton">Sync: off</button>
             </div>
             <div id="${SYNC_STATUS_ID}" class="ptreLocalSyncStatus">Sync: off</div>
+            <div id="${EDIT_LOCK_STATUS_ID}" class="ptreLocalEditStatus">Edición: local</div>
+            <div class="ptreLocalRow">
+                <button id="${EDIT_LOCK_TAKE_ID}" class="ptreLocalButton">Tomar control</button>
+                <button id="${EDIT_LOCK_RELEASE_ID}" class="ptreLocalButton">Liberar</button>
+            </div>
             <div class="ptreLocalSection">
                 <div class="ptreLocalSectionTitle">Objetivos</div>
                 <select id="${TARGET_SELECT_ID}">
@@ -320,8 +359,23 @@
                 });
             }
         }
+        const editLockTakeBtn = document.getElementById(EDIT_LOCK_TAKE_ID);
+        if (editLockTakeBtn && !editLockTakeBtn.dataset.bound) {
+            editLockTakeBtn.dataset.bound = 'true';
+            editLockTakeBtn.addEventListener('click', () => {
+                takeEditControl();
+            });
+        }
+        const editLockReleaseBtn = document.getElementById(EDIT_LOCK_RELEASE_ID);
+        if (editLockReleaseBtn && !editLockReleaseBtn.dataset.bound) {
+            editLockReleaseBtn.dataset.bound = 'true';
+            editLockReleaseBtn.addEventListener('click', () => {
+                releaseEditControl();
+            });
+        }
         updateSyncButtonLabel();
         renderSyncStatus();
+        renderEditLockStatus();
         const targetSelect = document.getElementById(TARGET_SELECT_ID);
         if (targetSelect && !targetSelect.dataset.bound) {
             targetSelect.dataset.bound = 'true';
@@ -453,6 +507,146 @@
         syncOnline = false;
         syncLastError = reason ? String(reason) : '';
         renderSyncStatus();
+    }
+
+    function normalizeRemoteEditLock(payload) {
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            return null;
+        }
+        const lock = payload.editLock;
+        if (!lock || typeof lock !== 'object' || Array.isArray(lock)) {
+            return null;
+        }
+        const ownerId = String(lock.ownerId || '').trim();
+        const expiresAt = Number(lock.expiresAt || 0);
+        if (!ownerId || !Number.isFinite(expiresAt) || expiresAt <= 0) {
+            return null;
+        }
+        const ownerLabel = String(lock.ownerLabel || ownerId).trim() || ownerId;
+        const updatedAt = Number(lock.updatedAt || 0);
+        return {
+            ownerId: ownerId,
+            ownerLabel: ownerLabel,
+            expiresAt: expiresAt,
+            updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0
+        };
+    }
+
+    function isRemoteLockActive(lock) {
+        return Boolean(lock && typeof lock === 'object' && Number(lock.expiresAt || 0) > Date.now());
+    }
+
+    function isLocalEditorLockOwner() {
+        return isRemoteLockActive(syncRemoteEditLock) && syncRemoteEditLock.ownerId === syncActorId;
+    }
+
+    function canEditSharedTargets() {
+        if (!isSyncEnabled()) {
+            return true;
+        }
+        if (!isSyncConfigured()) {
+            return false;
+        }
+        return isLocalEditorLockOwner();
+    }
+
+    function getEditBlockedMessage() {
+        if (!isSyncEnabled()) {
+            return '';
+        }
+        if (!isSyncConfigured()) {
+            return 'Configura Sync antes de editar';
+        }
+        if (!isRemoteLockActive(syncRemoteEditLock)) {
+            return 'Edición bloqueada: pulsa "Tomar control"';
+        }
+        return 'Edición en uso por ' + (syncRemoteEditLock.ownerLabel || syncRemoteEditLock.ownerId || 'otro equipo');
+    }
+
+    function getLocalEditorLabel() {
+        return isSyncHost() ? 'master' : (isSyncSlave() ? 'slave' : 'local');
+    }
+
+    function renderEditLockStatus() {
+        const el = document.getElementById(EDIT_LOCK_STATUS_ID);
+        const takeBtn = document.getElementById(EDIT_LOCK_TAKE_ID);
+        const releaseBtn = document.getElementById(EDIT_LOCK_RELEASE_ID);
+        if (!el) {
+            return;
+        }
+        let text = 'Edición: local';
+        let kind = '';
+        let canTake = false;
+        let canRelease = false;
+
+        if (!isSyncEnabled()) {
+            text = 'Edición: local (sync off)';
+        } else if (!isSyncConfigured()) {
+            text = 'Edición: sync sin configurar';
+            kind = 'error';
+        } else if (!isRemoteLockActive(syncRemoteEditLock)) {
+            text = 'Edición: libre';
+            canTake = true;
+        } else if (isLocalEditorLockOwner()) {
+            const until = new Date(syncRemoteEditLock.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            text = 'Edición: tuya (' + getLocalEditorLabel() + ') hasta ' + until;
+            kind = 'ok';
+            canRelease = true;
+        } else {
+            const until = new Date(syncRemoteEditLock.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            text = 'Edición: ' + (syncRemoteEditLock.ownerLabel || syncRemoteEditLock.ownerId) + ' hasta ' + until;
+            kind = 'error';
+            canTake = true;
+        }
+
+        el.textContent = text;
+        el.classList.remove('ok', 'error');
+        if (kind) {
+            el.classList.add(kind);
+        }
+        if (takeBtn) {
+            takeBtn.disabled = !canTake;
+        }
+        if (releaseBtn) {
+            releaseBtn.disabled = !canRelease;
+        }
+    }
+
+    function updateRemoteEditLockFromPayload(payload) {
+        syncRemoteEditLock = normalizeRemoteEditLock(payload);
+        renderEditLockStatus();
+        refreshTargetIcons();
+    }
+
+    function canPushTargetsSync() {
+        return isSyncEnabled() && isSyncConfigured() && isLocalEditorLockOwner();
+    }
+
+    function startEditLockHeartbeat() {
+        if (syncEditLockHeartbeatTimer) {
+            clearInterval(syncEditLockHeartbeatTimer);
+            syncEditLockHeartbeatTimer = null;
+        }
+        if (!isLocalEditorLockOwner() || !isSyncConfigured()) {
+            return;
+        }
+        syncEditLockHeartbeatTimer = setInterval(() => {
+            if (!isLocalEditorLockOwner() || !isSyncConfigured()) {
+                if (syncEditLockHeartbeatTimer) {
+                    clearInterval(syncEditLockHeartbeatTimer);
+                    syncEditLockHeartbeatTimer = null;
+                }
+                return;
+            }
+            sendEditLockCommand('heartbeat').catch(() => {});
+        }, Math.max(10000, Number(SYNC_EDIT_LOCK_HEARTBEAT_MS) || 45000));
+    }
+
+    function stopEditLockHeartbeat() {
+        if (syncEditLockHeartbeatTimer) {
+            clearInterval(syncEditLockHeartbeatTimer);
+            syncEditLockHeartbeatTimer = null;
+        }
     }
 
     function looksLikeTargetKey(key) {
@@ -782,8 +976,116 @@
         };
     }
 
+    function applyRemoteTargetsFromPayload(payload, force, onApplied) {
+        const remote = parseRemoteTargetsPayload(payload);
+        if (!remote) {
+            return false;
+        }
+        const remoteSerialized = JSON.stringify(remote.targets);
+        const localSerialized = JSON.stringify(loadTargets());
+        const hasChange = Boolean(force)
+            || remote.updatedAt > syncLastRemoteUpdatedAt
+            || remoteSerialized !== syncLastRemoteSerialized;
+        if (!hasChange) {
+            return false;
+        }
+        syncLastRemoteUpdatedAt = remote.updatedAt;
+        syncLastRemoteSerialized = remoteSerialized;
+        if (remoteSerialized === localSerialized) {
+            return false;
+        }
+        saveTargets(remote.targets, { skipSync: true });
+        refreshTargetIcons();
+        updateTargetPanel();
+        if (typeof onApplied === 'function') {
+            onApplied();
+        }
+        return true;
+    }
+
+    function sendEditLockCommand(action) {
+        if (!isSyncEnabled() || !isSyncConfigured()) {
+            return Promise.resolve({ ok: false, reason: 'sync_not_configured' });
+        }
+        return requestSyncJson('PUT', {
+            editLockCommand: {
+                action: String(action || '').toLowerCase(),
+                ownerId: syncActorId,
+                ownerLabel: getLocalEditorLabel(),
+                token: syncEditorToken,
+                ttlMs: SYNC_EDIT_LOCK_TTL_MS,
+                now: Date.now()
+            }
+        }).then((payload) => {
+            applyRemoteTargetsFromPayload(payload, false, null);
+            updateRemoteEditLockFromPayload(payload);
+            const result = payload && typeof payload.lockResult === 'object' ? payload.lockResult : { ok: false, reason: 'unknown' };
+            if (isLocalEditorLockOwner()) {
+                startEditLockHeartbeat();
+            } else {
+                stopEditLockHeartbeat();
+            }
+            return result;
+        });
+    }
+
+    function takeEditControl() {
+        if (!isSyncEnabled()) {
+            setStatus('Sync off: edición local');
+            return;
+        }
+        if (!isSyncConfigured()) {
+            setStatus('Configura Sync antes de tomar control');
+            return;
+        }
+        setStatus('Tomando control de edición...');
+        sendEditLockCommand('acquire').then((result) => {
+            if (result && result.ok) {
+                setStatus('Control de edición tomado');
+                renderEditLockStatus();
+                return;
+            }
+            const owner = result && (result.ownerLabel || result.ownerId) ? (result.ownerLabel || result.ownerId) : 'otro equipo';
+            if (result && result.reason === 'occupied') {
+                setStatus('Edición ocupada por ' + owner);
+            } else {
+                setStatus('No se pudo tomar control de edición');
+            }
+            renderEditLockStatus();
+        }).catch((err) => {
+            console.warn('[PTRE sync] take edit control failed:', err);
+            setStatus('Error tomando control de edición');
+            renderEditLockStatus();
+        });
+    }
+
+    function releaseEditControl() {
+        if (!isSyncEnabled() || !isSyncConfigured()) {
+            setStatus('Sync no activo');
+            return;
+        }
+        if (!isLocalEditorLockOwner()) {
+            setStatus('No tienes control de edición');
+            return;
+        }
+        setStatus('Liberando control de edición...');
+        sendEditLockCommand('release').then((result) => {
+            if (result && result.ok) {
+                stopEditLockHeartbeat();
+                setStatus('Control de edición liberado');
+            } else {
+                setStatus('No se pudo liberar control');
+            }
+            renderEditLockStatus();
+        }).catch((err) => {
+            console.warn('[PTRE sync] release edit control failed:', err);
+            setStatus('Error liberando control de edición');
+            renderEditLockStatus();
+        });
+    }
+
     function queueHostTargetsSync(targets) {
-        if (!isSyncHost() || !isSyncConfigured()) {
+        if (!canPushTargetsSync()) {
             return;
         }
         syncPendingTargets = normalizeTargets(targets);
@@ -797,7 +1099,7 @@
     }
 
     function flushHostTargetsSync() {
-        if (!isSyncHost() || !isSyncConfigured() || !syncPendingTargets) {
+        if (!canPushTargetsSync() || !syncPendingTargets) {
             return;
         }
         if (syncPushInFlight) {
@@ -815,6 +1117,8 @@
         requestSyncJson('PUT', {
             targets: targetsToSend,
             updatedAt: Date.now()
+        }).then((payload) => {
+            updateRemoteEditLockFromPayload(payload);
         }).catch((err) => {
             console.warn('[PTRE sync host] push failed:', err);
         }).finally(() => {
@@ -870,6 +1174,8 @@
         requestSyncJson('PUT', {
             activityBatch: batch,
             activityUpdatedAt: Date.now()
+        }).then((payload) => {
+            updateRemoteEditLockFromPayload(payload);
         }).catch((err) => {
             console.warn('[PTRE sync slave] activity push failed:', err);
             syncPendingActivity = batch.concat(syncPendingActivity);
@@ -1007,32 +1313,23 @@
     }
 
     function pullTargetsFromRemote(force) {
-        if (!isSyncSlave() || !isSyncConfigured() || syncPullInFlight) {
+        if (!isSyncEnabled() || !isSyncConfigured() || syncPullInFlight) {
             return;
         }
         syncPullInFlight = true;
         requestSyncJson('GET').then((payload) => {
-            const remote = parseRemoteTargetsPayload(payload);
-            if (remote) {
-                const remoteSerialized = JSON.stringify(remote.targets);
-                const localSerialized = JSON.stringify(loadTargets());
-                const hasChange = force
-                    || remote.updatedAt > syncLastRemoteUpdatedAt
-                    || remoteSerialized !== syncLastRemoteSerialized;
-                if (hasChange) {
-                    syncLastRemoteUpdatedAt = remote.updatedAt;
-                    syncLastRemoteSerialized = remoteSerialized;
-                    if (remoteSerialized !== localSerialized) {
-                        saveTargets(remote.targets, { skipSync: true });
-                        refreshTargetIcons();
-                        updateTargetPanel();
-                        setStatus('Sync esclava: objetivos actualizados');
-                    }
-                }
+            applyRemoteTargetsFromPayload(payload, force, () => {
+                setStatus('Sync: objetivos actualizados');
+            });
+            updateRemoteEditLockFromPayload(payload);
+            if (isLocalEditorLockOwner()) {
+                startEditLockHeartbeat();
+            } else {
+                stopEditLockHeartbeat();
             }
             applyRemoteControlCommand(payload);
         }).catch((err) => {
-            console.warn('[PTRE sync slave] pull failed:', err);
+            console.warn('[PTRE sync] pull failed:', err);
         }).finally(() => {
             syncPullInFlight = false;
         });
@@ -1041,22 +1338,26 @@
     function startTargetsSync() {
         if (!isSyncEnabled()) {
             setSyncOffline('');
+            syncRemoteEditLock = null;
+            stopEditLockHeartbeat();
             refreshExecuteSlaveToggle();
+            renderEditLockStatus();
+            refreshTargetIcons();
             return;
         }
         if (!isSyncConfigured()) {
             console.warn('[PTRE sync] mode enabled but syncEndpoint is not valid');
             setSyncOffline('config incompleta');
+            stopEditLockHeartbeat();
             refreshExecuteSlaveToggle();
+            renderEditLockStatus();
             return;
         }
         setSyncOffline('');
         refreshExecuteSlaveToggle();
-        if (isSyncHost()) {
-            queueHostTargetsSync(loadTargets());
-            return;
-        }
+        renderEditLockStatus();
         pullTargetsFromRemote(true);
+        queueHostTargetsSync(loadTargets());
         if (syncPullTimer) {
             clearInterval(syncPullTimer);
         }
@@ -1079,6 +1380,7 @@
             clearTimeout(syncActivityPushTimer);
             syncActivityPushTimer = null;
         }
+        stopEditLockHeartbeat();
         syncPullInFlight = false;
         syncPushInFlight = false;
         syncActivityPushInFlight = false;
@@ -1086,8 +1388,11 @@
         syncPendingActivity = [];
         syncLastRemoteUpdatedAt = 0;
         syncLastRemoteSerialized = '';
+        syncRemoteEditLock = null;
         setSyncOffline('');
         refreshExecuteSlaveToggle();
+        renderEditLockStatus();
+        refreshTargetIcons();
     }
 
     function restartTargetsSync() {
@@ -1103,6 +1408,7 @@
         btn.textContent = 'Sync: ' + syncMode;
         renderSyncStatus();
         refreshExecuteSlaveToggle();
+        renderEditLockStatus();
     }
 
     function configureSyncSettings() {
@@ -1147,7 +1453,7 @@
             } else {
                 icon.classList.remove(ICON_TARGET_CLASS);
             }
-            icon.title = isSyncSlave() ? 'Modo esclava: solo lectura' : 'Marcar objetivo';
+            icon.title = canEditSharedTargets() ? 'Marcar objetivo' : 'Objetivos bloqueados';
         });
     }
 
@@ -1716,7 +2022,7 @@
             const targetKey = buildTargetKey(playerId, playerName);
             const icon = document.createElement('span');
             icon.className = ICON_CLASS;
-            icon.title = isSyncSlave() ? 'Modo esclava: solo lectura' : 'Marcar objetivo';
+            icon.title = canEditSharedTargets() ? 'Marcar objetivo' : 'Objetivos bloqueados';
             icon.dataset.playerName = playerName || 'Desconocido';
             icon.dataset.targetKey = targetKey;
             if (targets[targetKey]) {
@@ -1724,8 +2030,8 @@
             }
             icon.addEventListener('click', (event) => {
                 event.stopPropagation();
-                if (isSyncSlave()) {
-                    setStatus('Modo esclava: objetivos solo lectura');
+                if (!canEditSharedTargets()) {
+                    setStatus(getEditBlockedMessage());
                     return;
                 }
                 const key = icon.dataset.targetKey;
@@ -1798,7 +2104,7 @@
         const opts = options || {};
         const normalized = normalizeTargets(targets);
         GM_setValue(KEY_TARGETS, JSON.stringify(normalized));
-        if (!opts.skipSync && isSyncHost()) {
+        if (!opts.skipSync && canPushTargetsSync()) {
             queueHostTargetsSync(normalized);
         }
     }
