@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.21
+// @version      0.7.22
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -9,7 +9,9 @@
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      *
 // ==/UserScript==
 
 (function() {
@@ -28,11 +30,15 @@
     const KEY_SCAN_SPEED = 'ptreLocalScanSpeed';
     const KEY_CONTINUOUS_INTERVAL = 'ptreLocalContinuousInterval';
     const KEY_CONTINUOUS_ACTIVE = 'ptreLocalContinuousActive';
+    const KEY_SYNC_MODE = 'ptreLocalSyncMode';
+    const KEY_SYNC_ENDPOINT = 'ptreLocalSyncEndpoint';
+    const KEY_SYNC_TOKEN = 'ptreLocalSyncToken';
     const SCAN_SPEED_ID = 'ptreLocalScanSpeed';
     const CONTINUOUS_INTERVAL_ID = 'ptreLocalContinuousInterval';
     const SCAN_START_ID = 'ptreLocalScanStart';
     const SCAN_CONTINUOUS_ID = 'ptreLocalScanContinuous';
     const SCAN_STOP_ID = 'ptreLocalScanStop';
+    const SYNC_CONFIG_ID = 'ptreLocalSyncConfig';
 
     const DB_NAME = 'ptreLocalActivityDB';
     const DB_VERSION = 3;
@@ -53,6 +59,15 @@
         ['ultimo', 'servidor', 'jugado'],
         ['last', 'played']
     ];
+
+    // Sync host/slave defaults for targets. Real values are loaded from GM storage per machine.
+    const DEFAULT_SYNC_MODE = 'off'; // off | host | slave
+    const DEFAULT_SYNC_ENDPOINT = ''; // Example: http://YOUR_VPS_IP:8787/targets
+    const DEFAULT_SYNC_TOKEN = ''; // Must match X-PTRE-Token expected by your VPS endpoint.
+    const SYNC_PULL_INTERVAL_MS = 5000;
+    const SYNC_PUSH_DEBOUNCE_MS = 700;
+    const SYNC_HTTP_TIMEOUT_MS = 10000;
+    const SYNC_TOKEN_HEADER = 'x-ptre-token';
 
     const isLobby = location.hostname === 'lobby.ogame.gameforge.com' || /\/lobby/i.test(location.pathname);
     if (isLobby) {
@@ -88,6 +103,16 @@
     let scanPendingSince = 0;
     let scanWatchdogId = null;
     let reloadScheduled = false;
+    let syncMode = normalizeSyncMode(String(GM_getValue(KEY_SYNC_MODE, DEFAULT_SYNC_MODE) || DEFAULT_SYNC_MODE));
+    let syncEndpoint = String(GM_getValue(KEY_SYNC_ENDPOINT, DEFAULT_SYNC_ENDPOINT) || DEFAULT_SYNC_ENDPOINT).trim();
+    let syncToken = String(GM_getValue(KEY_SYNC_TOKEN, DEFAULT_SYNC_TOKEN) || DEFAULT_SYNC_TOKEN).trim();
+    let syncPullTimer = null;
+    let syncPullInFlight = false;
+    let syncPushTimer = null;
+    let syncPushInFlight = false;
+    let syncPendingTargets = null;
+    let syncLastRemoteUpdatedAt = 0;
+    let syncLastRemoteSerialized = '';
 
     function addStyles() {
         GM_addStyle(`
@@ -191,6 +216,7 @@
             <div id="${STATUS_ID}">Listo</div>
             <div class="ptreLocalActions">
                 <button id="${OPEN_ID}" class="ptreLocalButton">Abrir historial</button>
+                <button id="${SYNC_CONFIG_ID}" class="ptreLocalButton">Sync: off</button>
             </div>
             <div class="ptreLocalSection">
                 <div class="ptreLocalSectionTitle">Objetivos</div>
@@ -231,6 +257,12 @@
         if (openBtn) {
             openBtn.addEventListener('click', openHistoryWindow);
         }
+        const syncConfigBtn = document.getElementById(SYNC_CONFIG_ID);
+        if (syncConfigBtn && !syncConfigBtn.dataset.bound) {
+            syncConfigBtn.dataset.bound = 'true';
+            syncConfigBtn.addEventListener('click', configureSyncSettings);
+        }
+        updateSyncButtonLabel();
         const targetSelect = document.getElementById(TARGET_SELECT_ID);
         if (targetSelect && !targetSelect.dataset.bound) {
             targetSelect.dataset.bound = 'true';
@@ -296,6 +328,303 @@
         if (el) {
             el.textContent = message;
         }
+    }
+
+    function normalizeSyncMode(value) {
+        const mode = String(value || '').trim().toLowerCase();
+        if (mode === 'host' || mode === 'slave') {
+            return mode;
+        }
+        return 'off';
+    }
+
+    function isSyncHost() {
+        return syncMode === 'host';
+    }
+
+    function isSyncSlave() {
+        return syncMode === 'slave';
+    }
+
+    function isSyncEnabled() {
+        return isSyncHost() || isSyncSlave();
+    }
+
+    function isSyncConfigured() {
+        return isSyncEnabled() && /^https?:\/\//i.test(syncEndpoint);
+    }
+
+    function normalizeTargets(targets) {
+        const normalized = {};
+        if (!targets || typeof targets !== 'object' || Array.isArray(targets)) {
+            return normalized;
+        }
+        Object.keys(targets).forEach((key) => {
+            if (!key) {
+                return;
+            }
+            const value = targets[key];
+            if (value === true) {
+                normalized[key] = { name: '' };
+                return;
+            }
+            if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                return;
+            }
+            const copy = Object.assign({}, value);
+            copy.name = typeof copy.name === 'string' ? copy.name : '';
+            normalized[key] = copy;
+        });
+        return normalized;
+    }
+
+    function parseJsonSafe(text) {
+        if (!text || !text.trim()) {
+            return {};
+        }
+        try {
+            return JSON.parse(text);
+        } catch (err) {
+            return {};
+        }
+    }
+
+    function requestSyncJson(method, payload) {
+        const headers = {};
+        if (payload !== undefined) {
+            headers['Content-Type'] = 'application/json';
+        }
+        if (syncToken) {
+            headers[SYNC_TOKEN_HEADER] = syncToken;
+        }
+        const data = payload !== undefined ? JSON.stringify(payload) : undefined;
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest === 'function') {
+                GM_xmlhttpRequest({
+                    method: method,
+                    url: syncEndpoint,
+                    headers: headers,
+                    data: data,
+                    timeout: SYNC_HTTP_TIMEOUT_MS,
+                    onload: (res) => {
+                        if (res.status < 200 || res.status >= 300) {
+                            reject(new Error('sync http ' + res.status));
+                            return;
+                        }
+                        resolve(parseJsonSafe(res.responseText || ''));
+                    },
+                    onerror: () => reject(new Error('sync network error')),
+                    ontimeout: () => reject(new Error('sync timeout'))
+                });
+                return;
+            }
+            const init = {
+                method: method,
+                headers: headers
+            };
+            if (data !== undefined) {
+                init.body = data;
+            }
+            fetch(syncEndpoint, init)
+                .then(async (res) => {
+                    if (!res.ok) {
+                        throw new Error('sync http ' + res.status);
+                    }
+                    const text = await res.text();
+                    return parseJsonSafe(text);
+                })
+                .then(resolve)
+                .catch(reject);
+        });
+    }
+
+    function parseRemoteTargetsPayload(payload) {
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            return null;
+        }
+        let rawTargets = payload.targets;
+        if (!rawTargets || typeof rawTargets !== 'object' || Array.isArray(rawTargets)) {
+            rawTargets = payload;
+        }
+        const normalized = normalizeTargets(rawTargets);
+        const updatedAtRaw = Number(payload.updatedAt || payload.updated_at || payload.ts || Date.now());
+        const updatedAt = Number.isFinite(updatedAtRaw) ? updatedAtRaw : Date.now();
+        return {
+            targets: normalized,
+            updatedAt: updatedAt
+        };
+    }
+
+    function queueHostTargetsSync(targets) {
+        if (!isSyncHost() || !isSyncConfigured()) {
+            return;
+        }
+        syncPendingTargets = normalizeTargets(targets);
+        if (syncPushTimer) {
+            clearTimeout(syncPushTimer);
+        }
+        syncPushTimer = setTimeout(() => {
+            syncPushTimer = null;
+            flushHostTargetsSync();
+        }, SYNC_PUSH_DEBOUNCE_MS);
+    }
+
+    function flushHostTargetsSync() {
+        if (!isSyncHost() || !isSyncConfigured() || !syncPendingTargets) {
+            return;
+        }
+        if (syncPushInFlight) {
+            if (!syncPushTimer) {
+                syncPushTimer = setTimeout(() => {
+                    syncPushTimer = null;
+                    flushHostTargetsSync();
+                }, SYNC_PUSH_DEBOUNCE_MS);
+            }
+            return;
+        }
+        const targetsToSend = syncPendingTargets;
+        syncPendingTargets = null;
+        syncPushInFlight = true;
+        requestSyncJson('PUT', {
+            targets: targetsToSend,
+            updatedAt: Date.now()
+        }).catch((err) => {
+            console.warn('[PTRE sync host] push failed:', err);
+        }).finally(() => {
+            syncPushInFlight = false;
+            if (syncPendingTargets && !syncPushTimer) {
+                syncPushTimer = setTimeout(() => {
+                    syncPushTimer = null;
+                    flushHostTargetsSync();
+                }, SYNC_PUSH_DEBOUNCE_MS);
+            }
+        });
+    }
+
+    function pullTargetsFromRemote(force) {
+        if (!isSyncSlave() || !isSyncConfigured() || syncPullInFlight) {
+            return;
+        }
+        syncPullInFlight = true;
+        requestSyncJson('GET').then((payload) => {
+            const remote = parseRemoteTargetsPayload(payload);
+            if (!remote) {
+                return;
+            }
+            const remoteSerialized = JSON.stringify(remote.targets);
+            const localSerialized = JSON.stringify(loadTargets());
+            const hasChange = force
+                || remote.updatedAt > syncLastRemoteUpdatedAt
+                || remoteSerialized !== syncLastRemoteSerialized;
+            if (!hasChange) {
+                return;
+            }
+            syncLastRemoteUpdatedAt = remote.updatedAt;
+            syncLastRemoteSerialized = remoteSerialized;
+            if (remoteSerialized !== localSerialized) {
+                saveTargets(remote.targets, { skipSync: true });
+                refreshTargetIcons();
+                updateTargetPanel();
+                setStatus('Sync esclava: objetivos actualizados');
+            }
+        }).catch((err) => {
+            console.warn('[PTRE sync slave] pull failed:', err);
+        }).finally(() => {
+            syncPullInFlight = false;
+        });
+    }
+
+    function startTargetsSync() {
+        if (!isSyncEnabled()) {
+            return;
+        }
+        if (!isSyncConfigured()) {
+            console.warn('[PTRE sync] mode enabled but syncEndpoint is not valid');
+            return;
+        }
+        if (isSyncHost()) {
+            queueHostTargetsSync(loadTargets());
+            return;
+        }
+        pullTargetsFromRemote(true);
+        if (syncPullTimer) {
+            clearInterval(syncPullTimer);
+        }
+        const pollMs = Math.max(2000, Number(SYNC_PULL_INTERVAL_MS) || 5000);
+        syncPullTimer = setInterval(() => {
+            pullTargetsFromRemote(false);
+        }, pollMs);
+    }
+
+    function stopTargetsSync() {
+        if (syncPullTimer) {
+            clearInterval(syncPullTimer);
+            syncPullTimer = null;
+        }
+        if (syncPushTimer) {
+            clearTimeout(syncPushTimer);
+            syncPushTimer = null;
+        }
+        syncPullInFlight = false;
+        syncPushInFlight = false;
+        syncPendingTargets = null;
+        syncLastRemoteUpdatedAt = 0;
+        syncLastRemoteSerialized = '';
+    }
+
+    function restartTargetsSync() {
+        stopTargetsSync();
+        startTargetsSync();
+    }
+
+    function updateSyncButtonLabel() {
+        const btn = document.getElementById(SYNC_CONFIG_ID);
+        if (!btn) {
+            return;
+        }
+        btn.textContent = 'Sync: ' + syncMode;
+    }
+
+    function configureSyncSettings() {
+        const modeInput = window.prompt('Modo sync: off | host | slave', syncMode);
+        if (modeInput === null) {
+            return;
+        }
+        const endpointInput = window.prompt('Sync endpoint (ej: http://IP_VPS:8787/targets)', syncEndpoint);
+        if (endpointInput === null) {
+            return;
+        }
+        const tokenInput = window.prompt('Sync token (X-PTRE-Token, opcional)', syncToken);
+        if (tokenInput === null) {
+            return;
+        }
+        syncMode = normalizeSyncMode(modeInput);
+        syncEndpoint = String(endpointInput || '').trim();
+        syncToken = String(tokenInput || '').trim();
+        GM_setValue(KEY_SYNC_MODE, syncMode);
+        GM_setValue(KEY_SYNC_ENDPOINT, syncEndpoint);
+        GM_setValue(KEY_SYNC_TOKEN, syncToken);
+        updateSyncButtonLabel();
+        restartTargetsSync();
+        refreshTargetIcons();
+        setStatus('Sync: ' + syncMode);
+    }
+
+    function refreshTargetIcons() {
+        const targets = loadTargets();
+        const icons = document.querySelectorAll('.' + ICON_CLASS);
+        icons.forEach((icon) => {
+            const key = icon.dataset.targetKey;
+            if (!key) {
+                return;
+            }
+            if (targets[key]) {
+                icon.classList.add(ICON_TARGET_CLASS);
+            } else {
+                icon.classList.remove(ICON_TARGET_CLASS);
+            }
+            icon.title = isSyncSlave() ? 'Modo esclava: solo lectura' : 'Marcar objetivo';
+        });
     }
 
 
@@ -815,7 +1144,7 @@
             const targetKey = buildTargetKey(playerId, playerName);
             const icon = document.createElement('span');
             icon.className = ICON_CLASS;
-            icon.title = 'Marcar objetivo';
+            icon.title = isSyncSlave() ? 'Modo esclava: solo lectura' : 'Marcar objetivo';
             icon.dataset.playerName = playerName || 'Desconocido';
             icon.dataset.targetKey = targetKey;
             if (targets[targetKey]) {
@@ -823,6 +1152,10 @@
             }
             icon.addEventListener('click', (event) => {
                 event.stopPropagation();
+                if (isSyncSlave()) {
+                    setStatus('Modo esclava: objetivos solo lectura');
+                    return;
+                }
                 const key = icon.dataset.targetKey;
                 const store = loadTargets();
                 if (store[key]) {
@@ -882,22 +1215,20 @@
         const raw = GM_getValue(KEY_TARGETS, '{}');
         try {
             const parsed = JSON.parse(raw);
-            if (parsed && typeof parsed === 'object') {
-                Object.keys(parsed).forEach((key) => {
-                    if (parsed[key] === true) {
-                        parsed[key] = { name: '' };
-                    }
-                });
-                return parsed;
-            }
+            return normalizeTargets(parsed);
         } catch (err) {
             // ignore
         }
         return {};
     }
 
-    function saveTargets(targets) {
-        GM_setValue(KEY_TARGETS, JSON.stringify(targets));
+    function saveTargets(targets, options) {
+        const opts = options || {};
+        const normalized = normalizeTargets(targets);
+        GM_setValue(KEY_TARGETS, JSON.stringify(normalized));
+        if (!opts.skipSync && isSyncHost()) {
+            queueHostTargetsSync(normalized);
+        }
     }
 
     function updateTargetPanel() {
@@ -912,6 +1243,7 @@
         targetSelect.innerHTML = '<option value="">-- Selecciona --</option>';
         if (keys.length === 0) {
             coordsContainer.textContent = 'Sin objetivos';
+            refreshTargetIcons();
             return;
         }
         keys.forEach((key) => {
@@ -928,6 +1260,7 @@
             coordsContainer.textContent = 'Selecciona un jugador';
         }
         updateOptionNamesFromDb(keys, targets, targetSelect);
+        refreshTargetIcons();
     }
 
     function updateOptionNamesFromDb(keys, targets, targetSelect) {
@@ -1808,6 +2141,7 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
     }
 
     ensurePanel();
+    startTargetsSync();
     waitForGalaxyToBeLoaded();
     watchGalaxyChanges();
 })();
