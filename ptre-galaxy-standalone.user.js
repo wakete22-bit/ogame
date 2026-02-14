@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.25
+// @version      0.7.26
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -30,6 +30,8 @@
     const KEY_SCAN_SPEED = 'ptreLocalScanSpeed';
     const KEY_CONTINUOUS_INTERVAL = 'ptreLocalContinuousInterval';
     const KEY_CONTINUOUS_ACTIVE = 'ptreLocalContinuousActive';
+    const KEY_EXECUTE_ON_SLAVE = 'ptreLocalExecuteOnSlave';
+    const KEY_LAST_REMOTE_CMD = 'ptreLocalLastRemoteCmd';
     const KEY_SYNC_MODE = 'ptreLocalSyncMode';
     const KEY_SYNC_ENDPOINT = 'ptreLocalSyncEndpoint';
     const KEY_SYNC_TOKEN = 'ptreLocalSyncToken';
@@ -40,6 +42,7 @@
     const SCAN_STOP_ID = 'ptreLocalScanStop';
     const SYNC_CONFIG_ID = 'ptreLocalSyncConfig';
     const SYNC_STATUS_ID = 'ptreLocalSyncStatus';
+    const EXECUTE_SLAVE_ID = 'ptreLocalExecuteOnSlave';
 
     const DB_NAME = 'ptreLocalActivityDB';
     const DB_VERSION = 3;
@@ -100,6 +103,9 @@
     let scanPendingSince = 0;
     let scanWatchdogId = null;
     let reloadScheduled = false;
+    let executeOnSlave = Boolean(GM_getValue(KEY_EXECUTE_ON_SLAVE, false));
+    let remoteScanPlan = null;
+    let lastRemoteCmdId = String(GM_getValue(KEY_LAST_REMOTE_CMD, '') || '');
     let syncMode = normalizeSyncMode(String(GM_getValue(KEY_SYNC_MODE, DEFAULT_SYNC_MODE) || DEFAULT_SYNC_MODE));
     let syncEndpoint = String(GM_getValue(KEY_SYNC_ENDPOINT, DEFAULT_SYNC_ENDPOINT) || DEFAULT_SYNC_ENDPOINT).trim();
     let syncToken = String(GM_getValue(KEY_SYNC_TOKEN, DEFAULT_SYNC_TOKEN) || DEFAULT_SYNC_TOKEN).trim();
@@ -192,6 +198,18 @@
 #${PANEL_ID} .ptreLocalRow select {
     flex: 1 1 auto;
 }
+#${PANEL_ID} .ptreLocalToggle {
+    margin-top: 6px;
+}
+#${PANEL_ID} .ptreLocalToggle label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+#${PANEL_ID} .ptreLocalToggle input[type="checkbox"] {
+    margin: 0;
+}
 .${ICON_CLASS} {
     display: inline-block;
     width: 10px;
@@ -260,6 +278,12 @@
                     <button id="${SCAN_CONTINUOUS_ID}" class="ptreLocalButton">Continuo</button>
                     <button id="${SCAN_STOP_ID}" class="ptreLocalButton">Parar</button>
                 </div>
+                <div class="ptreLocalToggle">
+                    <label>
+                        <input id="${EXECUTE_SLAVE_ID}" type="checkbox">
+                        Ejecutar en esclavo
+                    </label>
+                </div>
             </div>
         `;
         document.body.appendChild(panel);
@@ -271,6 +295,18 @@
         if (syncConfigBtn && !syncConfigBtn.dataset.bound) {
             syncConfigBtn.dataset.bound = 'true';
             syncConfigBtn.addEventListener('click', configureSyncSettings);
+        }
+        const executeSlaveToggle = document.getElementById(EXECUTE_SLAVE_ID);
+        if (executeSlaveToggle) {
+            executeSlaveToggle.checked = Boolean(executeOnSlave);
+            executeSlaveToggle.disabled = !isSyncHost();
+            if (!executeSlaveToggle.dataset.bound) {
+                executeSlaveToggle.dataset.bound = 'true';
+                executeSlaveToggle.addEventListener('change', () => {
+                    executeOnSlave = Boolean(executeSlaveToggle.checked);
+                    GM_setValue(KEY_EXECUTE_ON_SLAVE, executeOnSlave);
+                });
+            }
         }
         updateSyncButtonLabel();
         renderSyncStatus();
@@ -312,6 +348,14 @@
         if (startBtn && !startBtn.dataset.bound) {
             startBtn.dataset.bound = 'true';
             startBtn.addEventListener('click', () => {
+                if (isSyncSlave()) {
+                    setStatus('Modo esclava: controlado por master');
+                    return;
+                }
+                if (executeOnSlave) {
+                    sendRemoteScanCommand(false);
+                    return;
+                }
                 startScan(false);
             });
         }
@@ -319,6 +363,14 @@
         if (continuousBtn && !continuousBtn.dataset.bound) {
             continuousBtn.dataset.bound = 'true';
             continuousBtn.addEventListener('click', () => {
+                if (isSyncSlave()) {
+                    setStatus('Modo esclava: controlado por master');
+                    return;
+                }
+                if (executeOnSlave) {
+                    sendRemoteScanCommand(true);
+                    return;
+                }
                 startScan(true);
             });
         }
@@ -326,6 +378,14 @@
         if (stopBtn && !stopBtn.dataset.bound) {
             stopBtn.dataset.bound = 'true';
             stopBtn.addEventListener('click', () => {
+                if (isSyncSlave()) {
+                    setStatus('Modo esclava: controlado por master');
+                    return;
+                }
+                if (executeOnSlave) {
+                    sendRemoteStopCommand();
+                    return;
+                }
                 GM_setValue(KEY_CONTINUOUS_ACTIVE, false);
                 stopScan('Recorrido detenido');
             });
@@ -381,6 +441,78 @@
         syncOnline = false;
         syncLastError = reason ? String(reason) : '';
         renderSyncStatus();
+    }
+
+    function looksLikeTargetKey(key) {
+        return typeof key === 'string' && (key.startsWith('id:') || key.startsWith('name:'));
+    }
+
+    function looksLikeTargetMap(obj) {
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+            return false;
+        }
+        const keys = Object.keys(obj);
+        if (keys.length === 0) {
+            return false;
+        }
+        return keys.every((key) => looksLikeTargetKey(key));
+    }
+
+    function normalizeCoord(coord) {
+        const raw = String(coord || '').trim();
+        if (!raw) {
+            return '';
+        }
+        const parts = raw.split(':');
+        if (parts.length !== 3) {
+            return '';
+        }
+        const nums = parts.map((part) => Number(part));
+        if (nums.some((num) => Number.isNaN(num) || num <= 0)) {
+            return '';
+        }
+        return nums.join(':');
+    }
+
+    function normalizeCoordList(list) {
+        if (!Array.isArray(list)) {
+            return [];
+        }
+        const set = new Set();
+        list.forEach((item) => {
+            const coord = normalizeCoord(item);
+            if (coord) {
+                set.add(coord);
+            }
+        });
+        return Array.from(set);
+    }
+
+    function buildRemoteControlCommand(action, extra) {
+        const payload = extra && typeof extra === 'object' ? extra : {};
+        return {
+            cmdId: String(Date.now()) + '-' + Math.random().toString(36).slice(2, 8),
+            action: String(action || '').toLowerCase(),
+            issuedAt: Date.now(),
+            continuous: Boolean(payload.continuous),
+            queue: normalizeCoordList(payload.queue),
+            scanDelayMs: clampSpeed(Number(payload.scanDelayMs || scanDelayMs)),
+            continuousIntervalMs: clampInterval(Number(payload.continuousIntervalMs || continuousIntervalMs))
+        };
+    }
+
+    function refreshExecuteSlaveToggle() {
+        const toggle = document.getElementById(EXECUTE_SLAVE_ID);
+        if (!toggle) {
+            return;
+        }
+        const allowed = isSyncHost();
+        if (!allowed && executeOnSlave) {
+            executeOnSlave = false;
+            GM_setValue(KEY_EXECUTE_ON_SLAVE, false);
+        }
+        toggle.checked = Boolean(executeOnSlave);
+        toggle.disabled = !allowed;
     }
 
     function normalizeSyncMode(value) {
@@ -510,8 +642,10 @@
         if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
             return null;
         }
-        let rawTargets = payload.targets;
-        if (!rawTargets || typeof rawTargets !== 'object' || Array.isArray(rawTargets)) {
+        let rawTargets = {};
+        if (payload.targets && typeof payload.targets === 'object' && !Array.isArray(payload.targets)) {
+            rawTargets = payload.targets;
+        } else if (looksLikeTargetMap(payload)) {
             rawTargets = payload;
         }
         const normalized = normalizeTargets(rawTargets);
@@ -569,6 +703,125 @@
         });
     }
 
+    function sendRemoteControlCommand(controlCommand) {
+        if (!isSyncHost()) {
+            setStatus('Sync host requerido para control remoto');
+            return Promise.resolve(false);
+        }
+        if (!isSyncConfigured()) {
+            setStatus('Configura Sync antes de controlar esclavo');
+            return Promise.resolve(false);
+        }
+        return requestSyncJson('PUT', {
+            control: controlCommand,
+            controlUpdatedAt: Date.now()
+        }).then(() => true).catch((err) => {
+            console.warn('[PTRE sync host] control command failed:', err);
+            return false;
+        });
+    }
+
+    function sendRemoteScanCommand(continuous) {
+        const targets = loadTargets();
+        const keys = Object.keys(targets);
+        if (keys.length === 0) {
+            setStatus('Sin objetivos para enviar a esclavo');
+            return;
+        }
+        setStatus('Preparando orden para esclavo...');
+        buildScanQueue(keys).then((queue) => {
+            const coords = normalizeCoordList(queue);
+            if (coords.length === 0) {
+                setStatus('Sin coordenadas para esclavo');
+                return;
+            }
+            const command = buildRemoteControlCommand('start', {
+                continuous: Boolean(continuous),
+                queue: coords,
+                scanDelayMs: scanDelayMs,
+                continuousIntervalMs: continuousIntervalMs
+            });
+            sendRemoteControlCommand(command).then((ok) => {
+                if (ok) {
+                    setStatus('Orden enviada a esclavo (' + coords.length + ' coords)');
+                } else {
+                    setStatus('No se pudo enviar orden a esclavo');
+                }
+            });
+        }).catch((err) => {
+            console.warn('[PTRE sync host] failed building remote queue:', err);
+            setStatus('Error preparando coordenadas para esclavo');
+        });
+    }
+
+    function sendRemoteStopCommand() {
+        const command = buildRemoteControlCommand('stop', {
+            continuous: false,
+            queue: [],
+            scanDelayMs: scanDelayMs,
+            continuousIntervalMs: continuousIntervalMs
+        });
+        sendRemoteControlCommand(command).then((ok) => {
+            if (ok) {
+                setStatus('Orden STOP enviada a esclavo');
+            } else {
+                setStatus('No se pudo enviar STOP a esclavo');
+            }
+        });
+    }
+
+    function applyRemoteControlCommand(payload) {
+        if (!isSyncSlave()) {
+            return;
+        }
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            return;
+        }
+        const control = payload.control;
+        if (!control || typeof control !== 'object' || Array.isArray(control)) {
+            return;
+        }
+        const cmdId = String(control.cmdId || '').trim();
+        if (!cmdId || cmdId === lastRemoteCmdId) {
+            return;
+        }
+        lastRemoteCmdId = cmdId;
+        GM_setValue(KEY_LAST_REMOTE_CMD, lastRemoteCmdId);
+
+        const action = String(control.action || '').toLowerCase();
+        if (action === 'stop') {
+            remoteScanPlan = null;
+            GM_setValue(KEY_CONTINUOUS_ACTIVE, false);
+            stopScan('Orden STOP recibida del master');
+            return;
+        }
+        if (action !== 'start') {
+            return;
+        }
+        const coords = normalizeCoordList(control.queue);
+        if (coords.length === 0) {
+            setStatus('Orden remota sin coordenadas');
+            return;
+        }
+        const remoteDelay = clampSpeed(Number(control.scanDelayMs || scanDelayMs));
+        const remoteInterval = clampInterval(Number(control.continuousIntervalMs || continuousIntervalMs));
+        const remoteContinuous = Boolean(control.continuous);
+
+        remoteScanPlan = {
+            queue: coords,
+            scanDelayMs: remoteDelay,
+            continuousIntervalMs: remoteInterval,
+            continuous: remoteContinuous
+        };
+        startScan(remoteContinuous, {
+            fromRemote: true,
+            queue: coords,
+            scanDelayMs: remoteDelay,
+            continuousIntervalMs: remoteInterval
+        });
+        setStatus('Orden recibida del master (' + coords.length + ' coords)');
+    }
+
     function pullTargetsFromRemote(force) {
         if (!isSyncSlave() || !isSyncConfigured() || syncPullInFlight) {
             return;
@@ -576,25 +829,24 @@
         syncPullInFlight = true;
         requestSyncJson('GET').then((payload) => {
             const remote = parseRemoteTargetsPayload(payload);
-            if (!remote) {
-                return;
+            if (remote) {
+                const remoteSerialized = JSON.stringify(remote.targets);
+                const localSerialized = JSON.stringify(loadTargets());
+                const hasChange = force
+                    || remote.updatedAt > syncLastRemoteUpdatedAt
+                    || remoteSerialized !== syncLastRemoteSerialized;
+                if (hasChange) {
+                    syncLastRemoteUpdatedAt = remote.updatedAt;
+                    syncLastRemoteSerialized = remoteSerialized;
+                    if (remoteSerialized !== localSerialized) {
+                        saveTargets(remote.targets, { skipSync: true });
+                        refreshTargetIcons();
+                        updateTargetPanel();
+                        setStatus('Sync esclava: objetivos actualizados');
+                    }
+                }
             }
-            const remoteSerialized = JSON.stringify(remote.targets);
-            const localSerialized = JSON.stringify(loadTargets());
-            const hasChange = force
-                || remote.updatedAt > syncLastRemoteUpdatedAt
-                || remoteSerialized !== syncLastRemoteSerialized;
-            if (!hasChange) {
-                return;
-            }
-            syncLastRemoteUpdatedAt = remote.updatedAt;
-            syncLastRemoteSerialized = remoteSerialized;
-            if (remoteSerialized !== localSerialized) {
-                saveTargets(remote.targets, { skipSync: true });
-                refreshTargetIcons();
-                updateTargetPanel();
-                setStatus('Sync esclava: objetivos actualizados');
-            }
+            applyRemoteControlCommand(payload);
         }).catch((err) => {
             console.warn('[PTRE sync slave] pull failed:', err);
         }).finally(() => {
@@ -605,14 +857,17 @@
     function startTargetsSync() {
         if (!isSyncEnabled()) {
             setSyncOffline('');
+            refreshExecuteSlaveToggle();
             return;
         }
         if (!isSyncConfigured()) {
             console.warn('[PTRE sync] mode enabled but syncEndpoint is not valid');
             setSyncOffline('config incompleta');
+            refreshExecuteSlaveToggle();
             return;
         }
         setSyncOffline('');
+        refreshExecuteSlaveToggle();
         if (isSyncHost()) {
             queueHostTargetsSync(loadTargets());
             return;
@@ -642,6 +897,7 @@
         syncLastRemoteUpdatedAt = 0;
         syncLastRemoteSerialized = '';
         setSyncOffline('');
+        refreshExecuteSlaveToggle();
     }
 
     function restartTargetsSync() {
@@ -656,6 +912,7 @@
         }
         btn.textContent = 'Sync: ' + syncMode;
         renderSyncStatus();
+        refreshExecuteSlaveToggle();
     }
 
     function configureSyncSettings() {
@@ -674,6 +931,10 @@
         syncMode = normalizeSyncMode(modeInput);
         syncEndpoint = String(endpointInput || '').trim();
         syncToken = String(tokenInput || '').trim();
+        if (!isSyncHost()) {
+            executeOnSlave = false;
+            GM_setValue(KEY_EXECUTE_ON_SLAVE, false);
+        }
         GM_setValue(KEY_SYNC_MODE, syncMode);
         GM_setValue(KEY_SYNC_ENDPOINT, syncEndpoint);
         GM_setValue(KEY_SYNC_TOKEN, syncToken);
@@ -1020,7 +1281,31 @@
 
     continuousIntervalMs = clampInterval(continuousIntervalMs);
 
-    function startScan(continuous) {
+    function applyScanQueueAndRun(queue) {
+        const coords = normalizeCoordList(queue);
+        if (!coords.length) {
+            return false;
+        }
+        scanQueue = coords;
+        scanIndex = 0;
+        scanActive = true;
+        scanPending = false;
+        runScanCurrent();
+        return true;
+    }
+
+    function startScan(continuous, options) {
+        const opts = options || {};
+        if (isSyncSlave() && !opts.fromRemote) {
+            setStatus('Modo esclava: controlado por master');
+            return;
+        }
+        if (opts.scanDelayMs !== undefined) {
+            scanDelayMs = clampSpeed(Number(opts.scanDelayMs));
+        }
+        if (opts.continuousIntervalMs !== undefined) {
+            continuousIntervalMs = clampInterval(Number(opts.continuousIntervalMs));
+        }
         if (continuous) {
             continuousActive = true;
             GM_setValue(KEY_CONTINUOUS_ACTIVE, true);
@@ -1028,14 +1313,28 @@
             continuousActive = false;
             GM_setValue(KEY_CONTINUOUS_ACTIVE, false);
         }
+        if (!opts.fromRemote) {
+            remoteScanPlan = null;
+        }
         if (scanActive) {
-            setStatus('Recorrido en curso');
+            if (!opts.fromRemote) {
+                setStatus('Recorrido en curso');
+                return;
+            }
+            stopScan('', { keepRemotePlan: true });
+        }
+        if (opts.queue && Array.isArray(opts.queue)) {
+            const started = applyScanQueueAndRun(opts.queue);
+            if (!started) {
+                setStatus('Sin coordenadas');
+            }
             return;
         }
         startScanRound();
     }
 
     function startScanRound() {
+        remoteScanPlan = null;
         const targets = loadTargets();
         const keys = Object.keys(targets);
         if (keys.length === 0) {
@@ -1047,26 +1346,25 @@
         }
         setStatus('Preparando recorrido...');
         buildScanQueue(keys).then((queue) => {
-            if (!queue || queue.length === 0) {
+            const started = applyScanQueueAndRun(queue);
+            if (!started) {
                 setStatus('Sin coordenadas');
                 if (continuousActive) {
                     scheduleNextRound();
                 }
-                return;
             }
-            scanQueue = queue;
-            scanIndex = 0;
-            scanActive = true;
-            scanPending = false;
-            runScanCurrent();
         });
     }
 
-    function stopScan(message) {
+    function stopScan(message, options) {
+        const opts = options || {};
         scanActive = false;
         continuousActive = false;
         scanPending = false;
         scanPendingSince = 0;
+        if (!opts.keepRemotePlan) {
+            remoteScanPlan = null;
+        }
         stopScanWatchdog();
         clearGalaxyLoadTimeout();
         if (scanTimer) {
@@ -1129,6 +1427,17 @@
         }
         continuousTimer = setTimeout(() => {
             if (continuousActive) {
+                if (isSyncSlave() && remoteScanPlan && remoteScanPlan.continuous) {
+                    scanDelayMs = clampSpeed(Number(remoteScanPlan.scanDelayMs || scanDelayMs));
+                    continuousIntervalMs = clampInterval(Number(remoteScanPlan.continuousIntervalMs || continuousIntervalMs));
+                    const started = applyScanQueueAndRun(remoteScanPlan.queue || []);
+                    if (!started) {
+                        continuousActive = false;
+                        GM_setValue(KEY_CONTINUOUS_ACTIVE, false);
+                        setStatus('Orden remota sin coordenadas');
+                    }
+                    return;
+                }
                 startScanRound();
             }
         }, continuousIntervalMs);
@@ -1184,7 +1493,7 @@
         addIcons();
         recordVisibleTargets();
         updateTargetPanel();
-        if (resumeContinuous && !resumeContinuousDone && !scanActive) {
+        if (resumeContinuous && !resumeContinuousDone && !scanActive && !isSyncSlave()) {
             resumeContinuousDone = true;
             startScan(true);
         }

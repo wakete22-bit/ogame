@@ -40,23 +40,93 @@ function safeNumber(value, fallback) {
     return Number.isFinite(num) ? num : fallback;
 }
 
+function looksLikeTargetKey(key) {
+    return typeof key === 'string' && (key.startsWith('id:') || key.startsWith('name:'));
+}
+
+function looksLikeTargetMap(obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+        return false;
+    }
+    const keys = Object.keys(obj);
+    if (keys.length === 0) {
+        return false;
+    }
+    return keys.every((key) => looksLikeTargetKey(key));
+}
+
+function normalizeCoord(coord) {
+    const raw = String(coord || '').trim();
+    if (!raw) {
+        return '';
+    }
+    const parts = raw.split(':');
+    if (parts.length !== 3) {
+        return '';
+    }
+    const nums = parts.map((part) => Number(part));
+    if (nums.some((num) => Number.isNaN(num) || num <= 0)) {
+        return '';
+    }
+    return nums.join(':');
+}
+
+function normalizeCoordList(input) {
+    if (!Array.isArray(input)) {
+        return [];
+    }
+    const set = new Set();
+    input.forEach((item) => {
+        const coord = normalizeCoord(item);
+        if (coord) {
+            set.add(coord);
+        }
+    });
+    return Array.from(set);
+}
+
+function normalizeControl(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        return null;
+    }
+    const action = String(input.action || '').toLowerCase();
+    if (action !== 'start' && action !== 'stop') {
+        return null;
+    }
+    const cmdId = String(input.cmdId || '').trim();
+    if (!cmdId) {
+        return null;
+    }
+    return {
+        cmdId: cmdId,
+        action: action,
+        issuedAt: safeNumber(input.issuedAt, Date.now()),
+        continuous: Boolean(input.continuous),
+        queue: normalizeCoordList(input.queue),
+        scanDelayMs: safeNumber(input.scanDelayMs, 1000),
+        continuousIntervalMs: safeNumber(input.continuousIntervalMs, 60000)
+    };
+}
+
 function loadState() {
     try {
         if (!fs.existsSync(DATA_FILE)) {
-            return { targets: {}, updatedAt: 0 };
+            return { targets: {}, updatedAt: 0, control: null, controlUpdatedAt: 0 };
         }
         const raw = fs.readFileSync(DATA_FILE, 'utf8');
         if (!raw.trim()) {
-            return { targets: {}, updatedAt: 0 };
+            return { targets: {}, updatedAt: 0, control: null, controlUpdatedAt: 0 };
         }
         const parsed = JSON.parse(raw);
         return {
             targets: normalizeTargets(parsed.targets),
-            updatedAt: safeNumber(parsed.updatedAt, 0)
+            updatedAt: safeNumber(parsed.updatedAt, 0),
+            control: normalizeControl(parsed.control),
+            controlUpdatedAt: safeNumber(parsed.controlUpdatedAt, 0)
         };
     } catch (err) {
         console.warn('[targets-sync-server] failed to load state:', err.message);
-        return { targets: {}, updatedAt: 0 };
+        return { targets: {}, updatedAt: 0, control: null, controlUpdatedAt: 0 };
     }
 }
 
@@ -104,18 +174,30 @@ function readBody(req) {
     });
 }
 
-function parseTargetsPayload(payload) {
+function parseUpdatePayload(payload) {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-        return { targets: {}, updatedAt: Date.now() };
+        return null;
     }
-    let rawTargets = payload.targets;
-    if (!rawTargets || typeof rawTargets !== 'object' || Array.isArray(rawTargets)) {
-        rawTargets = payload;
+    const update = {};
+
+    if (Object.prototype.hasOwnProperty.call(payload, 'targets') || looksLikeTargetMap(payload)) {
+        const rawTargets = Object.prototype.hasOwnProperty.call(payload, 'targets') ? payload.targets : payload;
+        update.targets = normalizeTargets(rawTargets);
+        update.updatedAt = safeNumber(payload.updatedAt, Date.now());
     }
-    return {
-        targets: normalizeTargets(rawTargets),
-        updatedAt: safeNumber(payload.updatedAt, Date.now())
-    };
+
+    if (Object.prototype.hasOwnProperty.call(payload, 'control')) {
+        const control = normalizeControl(payload.control);
+        if (control) {
+            update.control = control;
+            update.controlUpdatedAt = safeNumber(payload.controlUpdatedAt, Date.now());
+        }
+    }
+
+    if (!Object.keys(update).length) {
+        return null;
+    }
+    return update;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -148,11 +230,19 @@ const server = http.createServer(async (req, res) => {
     try {
         const rawBody = await readBody(req);
         const parsed = rawBody ? JSON.parse(rawBody) : {};
-        const payload = parseTargetsPayload(parsed);
-        state = {
-            targets: payload.targets,
-            updatedAt: payload.updatedAt
-        };
+        const update = parseUpdatePayload(parsed);
+        if (!update) {
+            sendJson(res, 400, { error: 'invalid payload' });
+            return;
+        }
+        if (Object.prototype.hasOwnProperty.call(update, 'targets')) {
+            state.targets = update.targets;
+            state.updatedAt = update.updatedAt;
+        }
+        if (Object.prototype.hasOwnProperty.call(update, 'control')) {
+            state.control = update.control;
+            state.controlUpdatedAt = update.controlUpdatedAt;
+        }
         persistState();
         sendJson(res, 200, state);
     } catch (err) {
