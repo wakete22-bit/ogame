@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.32
+// @version      0.7.33
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -32,6 +32,7 @@
     const KEY_CONTINUOUS_ACTIVE = 'ptreLocalContinuousActive';
     const KEY_EXECUTE_ON_SLAVE = 'ptreLocalExecuteOnSlave';
     const KEY_LAST_REMOTE_CMD = 'ptreLocalLastRemoteCmd';
+    const KEY_REMOTE_SCAN_PLAN = 'ptreLocalRemoteScanPlan';
     const KEY_SYNC_MODE = 'ptreLocalSyncMode';
     const KEY_SYNC_ENDPOINT = 'ptreLocalSyncEndpoint';
     const KEY_SYNC_TOKEN = 'ptreLocalSyncToken';
@@ -123,7 +124,10 @@
     let scanWatchdogId = null;
     let reloadScheduled = false;
     let executeOnSlave = Boolean(GM_getValue(KEY_EXECUTE_ON_SLAVE, false));
-    let remoteScanPlan = null;
+    let remoteScanPlan = loadStoredRemoteScanPlan();
+    if (!resumeContinuous && remoteScanPlan) {
+        clearRemoteScanPlan();
+    }
     let lastRemoteCmdId = String(GM_getValue(KEY_LAST_REMOTE_CMD, '') || '');
     let syncMode = normalizeSyncMode(String(GM_getValue(KEY_SYNC_MODE, DEFAULT_SYNC_MODE) || DEFAULT_SYNC_MODE));
     let syncEndpoint = String(GM_getValue(KEY_SYNC_ENDPOINT, DEFAULT_SYNC_ENDPOINT) || DEFAULT_SYNC_ENDPOINT).trim();
@@ -705,6 +709,55 @@
         return Array.from(set);
     }
 
+    function normalizeRemoteScanPlan(plan) {
+        if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
+            return null;
+        }
+        const queue = normalizeCoordList(plan.queue);
+        if (queue.length === 0) {
+            return null;
+        }
+        return {
+            queue: queue,
+            scanDelayMs: clampSpeed(Number(plan.scanDelayMs || scanDelayMs)),
+            continuousIntervalMs: clampInterval(Number(plan.continuousIntervalMs || continuousIntervalMs)),
+            continuous: Boolean(plan.continuous)
+        };
+    }
+
+    function loadStoredRemoteScanPlan() {
+        const raw = String(GM_getValue(KEY_REMOTE_SCAN_PLAN, '') || '').trim();
+        if (!raw) {
+            return null;
+        }
+        try {
+            const normalized = normalizeRemoteScanPlan(JSON.parse(raw));
+            if (!normalized) {
+                GM_setValue(KEY_REMOTE_SCAN_PLAN, '');
+            }
+            return normalized;
+        } catch (err) {
+            GM_setValue(KEY_REMOTE_SCAN_PLAN, '');
+            return null;
+        }
+    }
+
+    function clearRemoteScanPlan() {
+        remoteScanPlan = null;
+        GM_setValue(KEY_REMOTE_SCAN_PLAN, '');
+    }
+
+    function setRemoteScanPlan(plan) {
+        const normalized = normalizeRemoteScanPlan(plan);
+        if (!normalized) {
+            clearRemoteScanPlan();
+            return null;
+        }
+        remoteScanPlan = normalized;
+        GM_setValue(KEY_REMOTE_SCAN_PLAN, JSON.stringify(normalized));
+        return normalized;
+    }
+
     function normalizeActivityValue(value) {
         const raw = String(value || '-').trim();
         if (raw === '*') {
@@ -1273,7 +1326,6 @@
 
         const action = String(control.action || '').toLowerCase();
         if (action === 'stop') {
-            remoteScanPlan = null;
             GM_setValue(KEY_CONTINUOUS_ACTIVE, false);
             stopScan('Orden STOP recibida del master');
             return;
@@ -1290,19 +1342,23 @@
         const remoteInterval = clampInterval(Number(control.continuousIntervalMs || continuousIntervalMs));
         const remoteContinuous = Boolean(control.continuous);
 
-        remoteScanPlan = {
+        const remotePlan = setRemoteScanPlan({
             queue: coords,
             scanDelayMs: remoteDelay,
             continuousIntervalMs: remoteInterval,
             continuous: remoteContinuous
-        };
-        startScan(remoteContinuous, {
-            fromRemote: true,
-            queue: coords,
-            scanDelayMs: remoteDelay,
-            continuousIntervalMs: remoteInterval
         });
-        setStatus('Orden recibida del master (' + coords.length + ' coords)');
+        if (!remotePlan) {
+            setStatus('Orden remota invalida');
+            return;
+        }
+        startScan(Boolean(remotePlan.continuous), {
+            fromRemote: true,
+            queue: remotePlan.queue,
+            scanDelayMs: remotePlan.scanDelayMs,
+            continuousIntervalMs: remotePlan.continuousIntervalMs
+        });
+        setStatus('Orden recibida del master (' + remotePlan.queue.length + ' coords)');
     }
 
     function pullTargetsFromRemote(force) {
@@ -1746,7 +1802,8 @@
     function handleGalaxyLoadTimeout() {
         clearGalaxyLoadTimeout();
         if (scanActive && scanPending) {
-            stopScan('Timeout cargando galaxia. Recargando...');
+            const keepRemotePlan = Boolean(isSyncSlave() && continuousActive);
+            stopScan('Timeout cargando galaxia. Recargando...', { keepRemotePlan: keepRemotePlan });
             scheduleReload();
             return true;
         }
@@ -1806,7 +1863,7 @@
             GM_setValue(KEY_CONTINUOUS_ACTIVE, false);
         }
         if (!opts.fromRemote) {
-            remoteScanPlan = null;
+            clearRemoteScanPlan();
         }
         if (scanActive) {
             if (!opts.fromRemote) {
@@ -1826,7 +1883,7 @@
     }
 
     function startScanRound() {
-        remoteScanPlan = null;
+        clearRemoteScanPlan();
         const targets = loadTargets();
         const keys = Object.keys(targets);
         if (keys.length === 0) {
@@ -1855,7 +1912,7 @@
         scanPending = false;
         scanPendingSince = 0;
         if (!opts.keepRemotePlan) {
-            remoteScanPlan = null;
+            clearRemoteScanPlan();
         }
         stopScanWatchdog();
         clearGalaxyLoadTimeout();
@@ -1926,6 +1983,7 @@
                     if (!started) {
                         continuousActive = false;
                         GM_setValue(KEY_CONTINUOUS_ACTIVE, false);
+                        clearRemoteScanPlan();
                         setStatus('Orden remota sin coordenadas');
                     }
                     return;
@@ -1985,9 +2043,27 @@
         addIcons();
         recordVisibleTargets();
         updateTargetPanel();
-        if (resumeContinuous && !resumeContinuousDone && !scanActive && !isSyncSlave()) {
+        if (resumeContinuous && !resumeContinuousDone && !scanActive) {
             resumeContinuousDone = true;
-            startScan(true);
+            if (isSyncSlave()) {
+                const plan = remoteScanPlan || loadStoredRemoteScanPlan();
+                if (plan) {
+                    setRemoteScanPlan(plan);
+                    startScan(Boolean(plan.continuous), {
+                        fromRemote: true,
+                        queue: plan.queue,
+                        scanDelayMs: plan.scanDelayMs,
+                        continuousIntervalMs: plan.continuousIntervalMs
+                    });
+                    setStatus('Reanudando orden remota tras recarga');
+                } else {
+                    resumeContinuous = false;
+                    GM_setValue(KEY_CONTINUOUS_ACTIVE, false);
+                    setStatus('Reanudar: falta plan remoto, esperando master');
+                }
+            } else {
+                startScan(true);
+            }
         }
         if (scanActive && scanPending) {
             scanPending = false;
