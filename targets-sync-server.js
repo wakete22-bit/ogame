@@ -140,6 +140,7 @@ function normalizeEditLockCommand(input) {
         ownerLabel: ownerLabel,
         token: token,
         ttlMs: clampLockTtl(input.ttlMs),
+        force: Boolean(input.force),
         now: safeNumber(input.now, Date.now())
     };
 }
@@ -426,7 +427,7 @@ function applyEditLockCommand(command) {
     const current = state.editLock;
 
     if (command.action === 'acquire') {
-        if (current && current.ownerId !== command.ownerId) {
+        if (current && current.ownerId !== command.ownerId && !command.force) {
             return {
                 ok: false,
                 reason: 'occupied',
@@ -435,6 +436,8 @@ function applyEditLockCommand(command) {
                 expiresAt: current.expiresAt
             };
         }
+        const previousOwnerId = current ? current.ownerId : '';
+        const isTakeover = Boolean(current && current.ownerId !== command.ownerId);
         state.editLock = {
             ownerId: command.ownerId,
             ownerLabel: command.ownerLabel || command.ownerId,
@@ -445,6 +448,8 @@ function applyEditLockCommand(command) {
         return {
             ok: true,
             action: 'acquire',
+            takeover: isTakeover,
+            previousOwnerId: previousOwnerId,
             ownerId: state.editLock.ownerId,
             ownerLabel: state.editLock.ownerLabel,
             expiresAt: state.editLock.expiresAt
@@ -477,20 +482,7 @@ function applyEditLockCommand(command) {
     }
 
     if (command.action === 'release') {
-        if (!current) {
-            return { ok: true, action: 'release', released: false };
-        }
-        if (current.ownerId !== command.ownerId || current.token !== command.token) {
-            return {
-                ok: false,
-                reason: 'forbidden',
-                ownerId: current.ownerId,
-                ownerLabel: current.ownerLabel,
-                expiresAt: current.expiresAt
-            };
-        }
-        state.editLock = null;
-        return { ok: true, action: 'release', released: true };
+        return { ok: false, action: 'release', reason: 'release_disabled' };
     }
 
     return { ok: false, reason: 'invalid_action' };

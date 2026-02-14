@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.31
+// @version      0.7.32
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -47,7 +47,6 @@
     const EXECUTE_SLAVE_ID = 'ptreLocalExecuteOnSlave';
     const EDIT_LOCK_STATUS_ID = 'ptreLocalEditLockStatus';
     const EDIT_LOCK_TAKE_ID = 'ptreLocalEditLockTake';
-    const EDIT_LOCK_RELEASE_ID = 'ptreLocalEditLockRelease';
 
     const DB_NAME = 'ptreLocalActivityDB';
     const DB_VERSION = 3;
@@ -153,6 +152,8 @@
     let syncLastError = '';
     let syncRemoteEditLock = null;
     let syncEditLockHeartbeatTimer = null;
+    let syncEditLockClaimInFlight = false;
+    let syncEditLockLastClaimAt = 0;
     let historyBridgeBound = false;
 
     function addStyles() {
@@ -295,7 +296,6 @@
             <div id="${EDIT_LOCK_STATUS_ID}" class="ptreLocalEditStatus">Edición: local</div>
             <div class="ptreLocalRow">
                 <button id="${EDIT_LOCK_TAKE_ID}" class="ptreLocalButton">Tomar control</button>
-                <button id="${EDIT_LOCK_RELEASE_ID}" class="ptreLocalButton">Liberar</button>
             </div>
             <div class="ptreLocalSection">
                 <div class="ptreLocalSectionTitle">Objetivos</div>
@@ -364,13 +364,6 @@
             editLockTakeBtn.dataset.bound = 'true';
             editLockTakeBtn.addEventListener('click', () => {
                 takeEditControl();
-            });
-        }
-        const editLockReleaseBtn = document.getElementById(EDIT_LOCK_RELEASE_ID);
-        if (editLockReleaseBtn && !editLockReleaseBtn.dataset.bound) {
-            editLockReleaseBtn.dataset.bound = 'true';
-            editLockReleaseBtn.addEventListener('click', () => {
-                releaseEditControl();
             });
         }
         updateSyncButtonLabel();
@@ -558,7 +551,7 @@
             return 'Configura Sync antes de editar';
         }
         if (!isRemoteLockActive(syncRemoteEditLock)) {
-            return 'Edición bloqueada: pulsa "Tomar control"';
+            return 'Edición sin dueño: espera asignación o pulsa "Tomar control"';
         }
         return 'Edición en uso por ' + (syncRemoteEditLock.ownerLabel || syncRemoteEditLock.ownerId || 'otro equipo');
     }
@@ -570,28 +563,28 @@
     function renderEditLockStatus() {
         const el = document.getElementById(EDIT_LOCK_STATUS_ID);
         const takeBtn = document.getElementById(EDIT_LOCK_TAKE_ID);
-        const releaseBtn = document.getElementById(EDIT_LOCK_RELEASE_ID);
         if (!el) {
             return;
         }
         let text = 'Edición: local';
         let kind = '';
         let canTake = false;
-        let canRelease = false;
 
         if (!isSyncEnabled()) {
             text = 'Edición: local (sync off)';
         } else if (!isSyncConfigured()) {
             text = 'Edición: sync sin configurar';
             kind = 'error';
+            canTake = false;
         } else if (!isRemoteLockActive(syncRemoteEditLock)) {
-            text = 'Edición: libre';
+            text = 'Edición: sin dueño (asignando...)';
+            kind = 'error';
             canTake = true;
         } else if (isLocalEditorLockOwner()) {
             const until = new Date(syncRemoteEditLock.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
             text = 'Edición: tuya (' + getLocalEditorLabel() + ') hasta ' + until;
             kind = 'ok';
-            canRelease = true;
+            canTake = true;
         } else {
             const until = new Date(syncRemoteEditLock.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
             text = 'Edición: ' + (syncRemoteEditLock.ownerLabel || syncRemoteEditLock.ownerId) + ' hasta ' + until;
@@ -607,15 +600,15 @@
         if (takeBtn) {
             takeBtn.disabled = !canTake;
         }
-        if (releaseBtn) {
-            releaseBtn.disabled = !canRelease;
-        }
     }
 
     function updateRemoteEditLockFromPayload(payload) {
         syncRemoteEditLock = normalizeRemoteEditLock(payload);
         renderEditLockStatus();
         refreshTargetIcons();
+        if (!isRemoteLockActive(syncRemoteEditLock)) {
+            maybeAutoClaimEditLockIfMissing();
+        }
     }
 
     function canPushTargetsSync() {
@@ -647,6 +640,24 @@
             clearInterval(syncEditLockHeartbeatTimer);
             syncEditLockHeartbeatTimer = null;
         }
+    }
+
+    function maybeAutoClaimEditLockIfMissing() {
+        if (!isSyncEnabled() || !isSyncConfigured()) {
+            return;
+        }
+        if (isRemoteLockActive(syncRemoteEditLock) || syncEditLockClaimInFlight) {
+            return;
+        }
+        const now = Date.now();
+        if ((now - syncEditLockLastClaimAt) < 8000) {
+            return;
+        }
+        syncEditLockLastClaimAt = now;
+        syncEditLockClaimInFlight = true;
+        sendEditLockCommand('acquire', { force: false, silent: true }).finally(() => {
+            syncEditLockClaimInFlight = false;
+        });
     }
 
     function looksLikeTargetKey(key) {
@@ -1003,7 +1014,8 @@
         return true;
     }
 
-    function sendEditLockCommand(action) {
+    function sendEditLockCommand(action, options) {
+        const opts = options && typeof options === 'object' ? options : {};
         if (!isSyncEnabled() || !isSyncConfigured()) {
             return Promise.resolve({ ok: false, reason: 'sync_not_configured' });
         }
@@ -1014,6 +1026,7 @@
                 ownerLabel: getLocalEditorLabel(),
                 token: syncEditorToken,
                 ttlMs: SYNC_EDIT_LOCK_TTL_MS,
+                force: Boolean(opts.force),
                 now: Date.now()
             }
         }).then((payload) => {
@@ -1026,6 +1039,11 @@
                 stopEditLockHeartbeat();
             }
             return result;
+        }).catch((err) => {
+            if (!opts.silent) {
+                throw err;
+            }
+            return { ok: false, reason: 'request_failed' };
         });
     }
 
@@ -1039,7 +1057,7 @@
             return;
         }
         setStatus('Tomando control de edición...');
-        sendEditLockCommand('acquire').then((result) => {
+        sendEditLockCommand('acquire', { force: true }).then((result) => {
             if (result && result.ok) {
                 setStatus('Control de edición tomado');
                 renderEditLockStatus();
@@ -1055,31 +1073,6 @@
         }).catch((err) => {
             console.warn('[PTRE sync] take edit control failed:', err);
             setStatus('Error tomando control de edición');
-            renderEditLockStatus();
-        });
-    }
-
-    function releaseEditControl() {
-        if (!isSyncEnabled() || !isSyncConfigured()) {
-            setStatus('Sync no activo');
-            return;
-        }
-        if (!isLocalEditorLockOwner()) {
-            setStatus('No tienes control de edición');
-            return;
-        }
-        setStatus('Liberando control de edición...');
-        sendEditLockCommand('release').then((result) => {
-            if (result && result.ok) {
-                stopEditLockHeartbeat();
-                setStatus('Control de edición liberado');
-            } else {
-                setStatus('No se pudo liberar control');
-            }
-            renderEditLockStatus();
-        }).catch((err) => {
-            console.warn('[PTRE sync] release edit control failed:', err);
-            setStatus('Error liberando control de edición');
             renderEditLockStatus();
         });
     }
@@ -1340,6 +1333,7 @@
             setSyncOffline('');
             syncRemoteEditLock = null;
             stopEditLockHeartbeat();
+            syncEditLockClaimInFlight = false;
             refreshExecuteSlaveToggle();
             renderEditLockStatus();
             refreshTargetIcons();
@@ -1349,6 +1343,7 @@
             console.warn('[PTRE sync] mode enabled but syncEndpoint is not valid');
             setSyncOffline('config incompleta');
             stopEditLockHeartbeat();
+            syncEditLockClaimInFlight = false;
             refreshExecuteSlaveToggle();
             renderEditLockStatus();
             return;
@@ -1381,6 +1376,7 @@
             syncActivityPushTimer = null;
         }
         stopEditLockHeartbeat();
+        syncEditLockClaimInFlight = false;
         syncPullInFlight = false;
         syncPushInFlight = false;
         syncActivityPushInFlight = false;
