@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.28
+// @version      0.7.29
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -2264,6 +2264,7 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
   <button id="datePrev" title="Anterior">&lt;</button>
   <button id="dateToday" title="Hoy">Hoy</button>
   <button id="dateNext" title="Siguiente">&gt;</button>
+  <button id="refreshNow" title="Actualizar">Actualizar</button>
   <button id="clearPlayer" class="danger" title="Borrar jugador">Borrar jugador</button>
 </div>
 <div id="root"></div>
@@ -2728,6 +2729,7 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
             '<button id="datePrev" title="Anterior">&lt;</button>' +
             '<button id="dateToday" title="Hoy">Hoy</button>' +
             '<button id="dateNext" title="Siguiente">&gt;</button>' +
+            '<button id="refreshNow" title="Actualizar">Actualizar</button>' +
             '<button id="clearPlayer" class="danger" title="Borrar jugador">Borrar jugador</button>';
         if (meta && meta.nextSibling) {
             meta.parentNode.insertBefore(controls, meta.nextSibling);
@@ -2744,11 +2746,12 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
         const datePrev = document.getElementById('datePrev');
         const dateToday = document.getElementById('dateToday');
         const dateNext = document.getElementById('dateNext');
+        const refreshNow = document.getElementById('refreshNow');
         const clearPlayer = document.getElementById('clearPlayer');
         const meta = document.querySelector('.meta');
         if (meta) {
             meta.textContent = REMOTE_HISTORY_ONLY
-                ? 'Fuente: historial remoto del slave.'
+                ? 'Fuente: historial remoto del slave. Pulsa Actualizar para recargar.'
                 : 'Selecciona jugador y fecha.';
         }
 
@@ -2884,6 +2887,21 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
                 setDateOption(dateSelect, todayKey);
             });
         }
+        if (refreshNow && !refreshNow.dataset.bound) {
+            refreshNow.dataset.bound = 'true';
+            refreshNow.addEventListener('click', () => {
+                root.innerHTML = '';
+                if (playerSelect.value && dateSelect.value) {
+                    dateSelect.dispatchEvent(new Event('change'));
+                    return;
+                }
+                if (playerSelect.value) {
+                    playerSelect.dispatchEvent(new Event('change'));
+                    return;
+                }
+                render();
+            });
+        }
         if (clearPlayer) {
             clearPlayer.style.display = REMOTE_HISTORY_ONLY ? 'none' : '';
         }
@@ -2915,23 +2933,6 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
     }
 
     render();
-    const refreshMs = REMOTE_HISTORY_ONLY ? REMOTE_REFRESH_MS : BUCKET_MS;
-    setInterval(() => {
-        const dateSelect = document.getElementById('dateSelect');
-        if (REMOTE_HISTORY_ONLY) {
-            ensureRemoteDataset(true).catch((err) => {
-                const root = document.getElementById('root');
-                if (root) {
-                    setRootMessage(root, 'Error sync remoto: ' + (err && err.message ? err.message : 'desconocido'));
-                }
-            });
-        }
-        if (dateSelect && dateSelect.value) {
-            dateSelect.dispatchEvent(new Event('change'));
-        } else if (REMOTE_HISTORY_ONLY) {
-            render();
-        }
-    }, refreshMs);
 })();
 <\/script>
 </body>
