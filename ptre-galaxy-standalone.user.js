@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.27
+// @version      0.7.28
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -75,6 +75,9 @@
     const SYNC_ACTIVITY_MAX_QUEUE = 1000;
     const SYNC_HTTP_TIMEOUT_MS = 10000;
     const SYNC_TOKEN_HEADER = 'x-ptre-token';
+    const HISTORY_BRIDGE_REQUEST = 'ptreLocalHistoryRemoteRequest';
+    const HISTORY_BRIDGE_RESPONSE = 'ptreLocalHistoryRemoteResponse';
+    const HISTORY_BRIDGE_TIMEOUT_MS = 12000;
 
     const isLobby = location.hostname === 'lobby.ogame.gameforge.com' || /\/lobby/i.test(location.pathname);
     if (isLobby) {
@@ -124,6 +127,7 @@
     let syncLastRemoteSerialized = '';
     let syncOnline = false;
     let syncLastError = '';
+    let historyBridgeBound = false;
 
     function addStyles() {
         GM_addStyle(`
@@ -622,7 +626,31 @@
         }
     }
 
-    function requestSyncJson(method, payload) {
+    function appendQueryParam(url, key, value) {
+        const baseUrl = String(url || '').trim();
+        if (!baseUrl) {
+            return '';
+        }
+        try {
+            const parsed = new URL(baseUrl, window.location.href);
+            parsed.searchParams.set(key, value);
+            return parsed.toString();
+        } catch (err) {
+            const sep = baseUrl.indexOf('?') === -1 ? '?' : '&';
+            return baseUrl + sep + encodeURIComponent(key) + '=' + encodeURIComponent(value);
+        }
+    }
+
+    function buildRemoteActivitySyncUrl() {
+        return appendQueryParam(syncEndpoint, 'includeActivity', '1');
+    }
+
+    function requestSyncJson(method, payload, options) {
+        const opts = options && typeof options === 'object' ? options : {};
+        const requestUrl = String(opts.url || syncEndpoint || '').trim();
+        if (!/^https?:\/\//i.test(requestUrl)) {
+            return Promise.reject(new Error('sync endpoint invalid'));
+        }
         const headers = {};
         if (payload !== undefined) {
             headers['Content-Type'] = 'application/json';
@@ -635,7 +663,7 @@
             if (typeof GM_xmlhttpRequest === 'function') {
                 GM_xmlhttpRequest({
                     method: method,
-                    url: syncEndpoint,
+                    url: requestUrl,
                     headers: headers,
                     data: data,
                     timeout: SYNC_HTTP_TIMEOUT_MS,
@@ -666,7 +694,7 @@
             if (data !== undefined) {
                 init.body = data;
             }
-            fetch(syncEndpoint, init)
+            fetch(requestUrl, init)
                 .then(async (res) => {
                     if (!res.ok) {
                         setSyncOffline('http ' + res.status);
@@ -683,6 +711,53 @@
                     }
                     reject(err);
                 });
+        });
+    }
+
+    function ensureHistoryBridge() {
+        if (historyBridgeBound) {
+            return;
+        }
+        historyBridgeBound = true;
+        window.addEventListener('message', (event) => {
+            const data = event && event.data;
+            if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                return;
+            }
+            if (data.type !== HISTORY_BRIDGE_REQUEST) {
+                return;
+            }
+            const reqId = String(data.reqId || '').trim();
+            const sourceWin = event.source;
+            if (!reqId || !sourceWin || typeof sourceWin.postMessage !== 'function') {
+                return;
+            }
+            const reply = (payload, error) => {
+                try {
+                    sourceWin.postMessage({
+                        type: HISTORY_BRIDGE_RESPONSE,
+                        reqId: reqId,
+                        payload: payload || null,
+                        error: error ? String(error) : ''
+                    }, '*');
+                } catch (err) {
+                    // ignore bridge reply failures
+                }
+            };
+
+            if (!isSyncHost()) {
+                reply(null, 'modo host requerido');
+                return;
+            }
+            if (!isSyncConfigured()) {
+                reply(null, 'sync no configurado');
+                return;
+            }
+
+            const activityUrl = buildRemoteActivitySyncUrl();
+            requestSyncJson('GET', undefined, { url: activityUrl })
+                .then((payload) => reply(payload, ''))
+                .catch((err) => reply(null, err && err.message ? err.message : 'sync error'));
         });
     }
 
@@ -2136,6 +2211,9 @@
     }
 
     function openHistoryWindow() {
+        if (isSyncHost()) {
+            ensureHistoryBridge();
+        }
         const win = window.open('', 'ptreLocalHistory', 'width=1200,height=700');
         if (!win) {
             setStatus('Popup bloqueado');
@@ -2198,9 +2276,9 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
     const BUCKET_MS = ${BUCKET_MS};
     const RANGE_HOURS = ${DEFAULT_RANGE_HOURS};
     const REMOTE_HISTORY_ONLY = ${JSON.stringify(isSyncHost())};
-    const REMOTE_ENDPOINT = ${JSON.stringify(syncEndpoint)};
-    const REMOTE_TOKEN = ${JSON.stringify(syncToken)};
-    const REMOTE_TOKEN_HEADER = ${JSON.stringify(SYNC_TOKEN_HEADER)};
+    const HISTORY_BRIDGE_REQUEST = ${JSON.stringify(HISTORY_BRIDGE_REQUEST)};
+    const HISTORY_BRIDGE_RESPONSE = ${JSON.stringify(HISTORY_BRIDGE_RESPONSE)};
+    const HISTORY_BRIDGE_TIMEOUT_MS = ${HISTORY_BRIDGE_TIMEOUT_MS};
     const REMOTE_REFRESH_MS = 15000;
     let remoteDataset = { players: [], buckets: [] };
     let remoteLoadedAt = 0;
@@ -2274,18 +2352,54 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
         root.appendChild(line);
     }
 
-    function buildRemoteActivityUrl() {
-        if (!REMOTE_ENDPOINT) {
-            return '';
-        }
-        try {
-            const url = new URL(REMOTE_ENDPOINT, window.location.href);
-            url.searchParams.set('includeActivity', '1');
-            return url.toString();
-        } catch (err) {
-            const sep = REMOTE_ENDPOINT.indexOf('?') === -1 ? '?' : '&';
-            return REMOTE_ENDPOINT + sep + 'includeActivity=1';
-        }
+    function requestRemotePayloadThroughBridge() {
+        return new Promise((resolve, reject) => {
+            if (!window.opener || window.opener.closed) {
+                reject(new Error('ventana master no disponible'));
+                return;
+            }
+            const reqId = String(Date.now()) + '-' + Math.random().toString(36).slice(2, 8);
+            let done = false;
+            const timer = setTimeout(() => {
+                if (done) {
+                    return;
+                }
+                done = true;
+                window.removeEventListener('message', onMessage);
+                reject(new Error('timeout bridge'));
+            }, HISTORY_BRIDGE_TIMEOUT_MS);
+            const onMessage = (event) => {
+                const data = event && event.data;
+                if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                    return;
+                }
+                if (data.type !== HISTORY_BRIDGE_RESPONSE || data.reqId !== reqId) {
+                    return;
+                }
+                if (done) {
+                    return;
+                }
+                done = true;
+                clearTimeout(timer);
+                window.removeEventListener('message', onMessage);
+                if (data.error) {
+                    reject(new Error(String(data.error)));
+                    return;
+                }
+                resolve(data.payload || {});
+            };
+            window.addEventListener('message', onMessage);
+            try {
+                window.opener.postMessage({
+                    type: HISTORY_BRIDGE_REQUEST,
+                    reqId: reqId
+                }, '*');
+            } catch (err) {
+                clearTimeout(timer);
+                window.removeEventListener('message', onMessage);
+                reject(new Error('no se pudo pedir datos al master'));
+            }
+        });
     }
 
     function normalizeActivityValue(value) {
@@ -2398,25 +2512,7 @@ th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
     }
 
     async function fetchRemoteDataset() {
-        const url = buildRemoteActivityUrl();
-        if (!url) {
-            throw new Error('Sync endpoint vacío');
-        }
-        const headers = {};
-        if (REMOTE_TOKEN) {
-            headers[REMOTE_TOKEN_HEADER] = REMOTE_TOKEN;
-        }
-        const res = await fetch(url, { method: 'GET', headers: headers });
-        if (!res.ok) {
-            throw new Error('sync http ' + res.status);
-        }
-        const text = await res.text();
-        let payload = {};
-        try {
-            payload = text ? JSON.parse(text) : {};
-        } catch (err) {
-            payload = {};
-        }
+        const payload = await requestRemotePayloadThroughBridge();
         return normalizeRemoteDataset(payload);
     }
 
