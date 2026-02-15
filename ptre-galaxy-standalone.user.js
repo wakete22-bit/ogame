@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.36
+// @version      0.7.37
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -2952,6 +2952,8 @@ th.row-title { z-index: 4; }
 .bg-red { background: #d43635; color: #fff; }
 .bg-yellow { background: #d2a900; color: #111; }
 .bg-green { background: #2e7d32; color: #fff; }
+.debris-no { background: #000; color: #fff; }
+.debris-yes { background: #1f6feb; color: #fff; }
 </style>
 </head>
 <body>
@@ -3453,7 +3455,7 @@ th.row-title { z-index: 4; }
 
     function formatActivityValue(value, type) {
         if (type === 'debris') {
-            const cls = value === 'si' ? 'bg-red' : 'bg-green';
+            const cls = value === 'si' ? 'debris-yes' : 'debris-no';
             return '<span class="' + cls + '">' + value + '</span>';
         }
         if (value === '*') {
