@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.34
+// @version      0.7.35
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -48,6 +48,7 @@
     const EXECUTE_SLAVE_ID = 'ptreLocalExecuteOnSlave';
     const EDIT_LOCK_STATUS_ID = 'ptreLocalEditLockStatus';
     const EDIT_LOCK_TAKE_ID = 'ptreLocalEditLockTake';
+    const EDIT_LOCK_PASS_ID = 'ptreLocalEditLockPass';
 
     const DB_NAME = 'ptreLocalActivityDB';
     const DB_VERSION = 3;
@@ -309,6 +310,7 @@
             <div id="${EDIT_LOCK_STATUS_ID}" class="ptreLocalEditStatus">Edición: local</div>
             <div class="ptreLocalRow">
                 <button id="${EDIT_LOCK_TAKE_ID}" class="ptreLocalButton">Tomar control</button>
+                <button id="${EDIT_LOCK_PASS_ID}" class="ptreLocalButton">Pasar control</button>
             </div>
             <div class="ptreLocalSection">
                 <div class="ptreLocalSectionTitle">Objetivos</div>
@@ -377,6 +379,13 @@
             editLockTakeBtn.dataset.bound = 'true';
             editLockTakeBtn.addEventListener('click', () => {
                 takeEditControl();
+            });
+        }
+        const editLockPassBtn = document.getElementById(EDIT_LOCK_PASS_ID);
+        if (editLockPassBtn && !editLockPassBtn.dataset.bound) {
+            editLockPassBtn.dataset.bound = 'true';
+            editLockPassBtn.addEventListener('click', () => {
+                passEditControl();
             });
         }
         updateSyncButtonLabel();
@@ -573,9 +582,14 @@
         return isSyncHost() ? 'master' : (isSyncSlave() ? 'slave' : 'local');
     }
 
+    function canPassEditControl() {
+        return isSyncHost() && isSyncConfigured() && isLocalEditorLockOwner();
+    }
+
     function renderEditLockStatus() {
         const el = document.getElementById(EDIT_LOCK_STATUS_ID);
         const takeBtn = document.getElementById(EDIT_LOCK_TAKE_ID);
+        const passBtn = document.getElementById(EDIT_LOCK_PASS_ID);
         if (!el) {
             return;
         }
@@ -612,6 +626,9 @@
         }
         if (takeBtn) {
             takeBtn.disabled = !canTake;
+        }
+        if (passBtn) {
+            passBtn.disabled = !canPassEditControl();
         }
     }
 
@@ -657,6 +674,10 @@
 
     function maybeAutoClaimEditLockIfMissing() {
         if (!isSyncEnabled() || !isSyncConfigured()) {
+            return;
+        }
+        // Keep host from reclaiming immediately after "Pasar control".
+        if (isSyncHost()) {
             return;
         }
         if (isRemoteLockActive(syncRemoteEditLock) || syncEditLockClaimInFlight) {
@@ -1245,6 +1266,45 @@
         }).catch((err) => {
             console.warn('[PTRE sync] take edit control failed:', err);
             setStatus('Error tomando control de edición');
+            renderEditLockStatus();
+        });
+    }
+
+    function passEditControl() {
+        if (!isSyncEnabled()) {
+            setStatus('Sync off: edición local');
+            return;
+        }
+        if (!isSyncHost()) {
+            setStatus('Pasar control: solo disponible en master');
+            return;
+        }
+        if (!isSyncConfigured()) {
+            setStatus('Configura Sync antes de pasar control');
+            return;
+        }
+        if (!isLocalEditorLockOwner()) {
+            setStatus('No tienes el control para pasarlo');
+            return;
+        }
+        setStatus('Pasando control a esclava...');
+        sendEditLockCommand('release').then((result) => {
+            if (result && result.ok) {
+                setStatus('Control pasado. Esclava lo tomara en segundos');
+                renderEditLockStatus();
+                return;
+            }
+            if (result && result.reason === 'forbidden') {
+                setStatus('No se pudo pasar: lock ya no es tuyo');
+            } else if (result && result.reason === 'no_lock') {
+                setStatus('No hay lock activo para pasar');
+            } else {
+                setStatus('No se pudo pasar control');
+            }
+            renderEditLockStatus();
+        }).catch((err) => {
+            console.warn('[PTRE sync] pass edit control failed:', err);
+            setStatus('Error pasando control');
             renderEditLockStatus();
         });
     }
@@ -2824,8 +2884,11 @@ h2 { color: #9ccf5f; margin: 12px 0 6px; }
 .table-wrap { overflow-x: auto; border: 1px solid #000; background: #171d22; padding: 6px; }
 table { border-collapse: collapse; font-size: 11px; }
 th, td { border: 1px solid #000; padding: 2px 4px; min-width: 70px; vertical-align: top; }
-th { position: sticky; top: 0; background: #0f1317; z-index: 1; }
-.row-title { background: #0f1317; font-weight: bold; }
+th { position: sticky; top: 0; background: #0f1317; z-index: 2; }
+.row-title { background: #0f1317; font-weight: bold; box-shadow: 1px 0 0 #000; }
+td.row-title, th.row-title { position: sticky; left: 0; background: #0f1317; }
+td.row-title { z-index: 3; }
+th.row-title { z-index: 4; }
 .cell-empty { color: #44505a; }
 #controls { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
 #controls label { display: flex; gap: 6px; align-items: center; }

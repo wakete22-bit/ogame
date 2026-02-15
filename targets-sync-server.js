@@ -632,7 +632,21 @@ function applyEditLockCommand(command) {
     }
 
     if (command.action === 'release') {
-        return { ok: false, action: 'release', reason: 'release_disabled' };
+        if (!current) {
+            return { ok: false, action: 'release', reason: 'no_lock' };
+        }
+        if (current.ownerId !== command.ownerId || current.token !== command.token) {
+            return {
+                ok: false,
+                action: 'release',
+                reason: 'forbidden',
+                ownerId: current.ownerId,
+                ownerLabel: current.ownerLabel,
+                expiresAt: current.expiresAt
+            };
+        }
+        state.editLock = null;
+        return { ok: true, action: 'release' };
     }
 
     return { ok: false, reason: 'invalid_action' };
