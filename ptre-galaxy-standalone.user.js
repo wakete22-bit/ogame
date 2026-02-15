@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.37
+// @version      0.7.38
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -1138,6 +1138,39 @@
                     playerKey: playerKey,
                     primaryCoord: coord || ''
                 }, '');
+                return;
+            }
+            if (action === 'clearhistoryplayer') {
+                if (!isSyncHost()) {
+                    reply(null, 'modo host requerido');
+                    return;
+                }
+                if (!isSyncConfigured()) {
+                    reply(null, 'sync no configurado');
+                    return;
+                }
+                const playerKey = String(data.playerKey || '').trim();
+                if (!playerKey) {
+                    reply(null, 'playerKey requerido');
+                    return;
+                }
+                requestSyncJson('PUT', {
+                    activityClearPlayerKey: playerKey,
+                    activityUpdatedAt: Date.now()
+                }).then((payload) => {
+                    const result = payload && payload.clearActivityResult && typeof payload.clearActivityResult === 'object'
+                        ? payload.clearActivityResult
+                        : {};
+                    reply({
+                        ok: true,
+                        playerKey: playerKey,
+                        removedPlayer: Boolean(result.removedPlayer),
+                        removedBuckets: Number(result.removedBuckets || 0),
+                        removedAny: Boolean(result.removedAny)
+                    }, '');
+                }).catch((err) => {
+                    reply(null, err && err.message ? err.message : 'sync error');
+                });
                 return;
             }
             reply(null, 'accion no soportada');
@@ -3187,6 +3220,16 @@ th.row-title { z-index: 4; }
         });
     }
 
+    function clearHistoryForPlayerThroughBridge(playerKey) {
+        const key = String(playerKey || '').trim();
+        if (!key) {
+            return Promise.reject(new Error('playerKey requerido'));
+        }
+        return requestTargetsPayloadThroughBridge('clearHistoryPlayer', {
+            playerKey: key
+        });
+    }
+
     function normalizeActivityValue(value) {
         const raw = String(value || '-').trim();
         if (raw === '*') {
@@ -3856,9 +3899,9 @@ th.row-title { z-index: 4; }
             });
         }
         if (clearPlayer) {
-            clearPlayer.style.display = REMOTE_HISTORY_ONLY ? 'none' : '';
+            clearPlayer.style.display = '';
         }
-        if (!REMOTE_HISTORY_ONLY && clearPlayer && !clearPlayer.dataset.bound) {
+        if (clearPlayer && !clearPlayer.dataset.bound) {
             clearPlayer.dataset.bound = 'true';
             clearPlayer.addEventListener('click', async () => {
                 const playerKey = playerSelect.value;
@@ -3866,18 +3909,30 @@ th.row-title { z-index: 4; }
                     window.alert('Selecciona un jugador.');
                     return;
                 }
-                const ok = window.confirm('¿Borrar el historial del jugador seleccionado?');
+                const ok = window.confirm(REMOTE_HISTORY_ONLY
+                    ? '¿Borrar el historial remoto del jugador seleccionado?'
+                    : '¿Borrar el historial del jugador seleccionado?');
                 if (!ok) {
                     return;
                 }
-                const dbNow = await getSource();
-                await deletePlayerData(dbNow, playerKey);
-                playerSelect.value = '';
-                dateSelect.value = '';
-                dateSelect.disabled = true;
-                resetPrimarySelect();
-                root.innerHTML = '';
-                render();
+                try {
+                    if (REMOTE_HISTORY_ONLY) {
+                        await clearHistoryForPlayerThroughBridge(playerKey);
+                        remoteLoadedAt = 0;
+                        await ensureRemoteDataset(true);
+                    } else {
+                        const dbNow = await getSource();
+                        await deletePlayerData(dbNow, playerKey);
+                    }
+                    playerSelect.value = '';
+                    dateSelect.value = '';
+                    dateSelect.disabled = true;
+                    resetPrimarySelect();
+                    root.innerHTML = '';
+                    render();
+                } catch (err) {
+                    window.alert('No se pudo borrar historial: ' + (err && err.message ? err.message : 'error desconocido'));
+                }
             });
         }
 

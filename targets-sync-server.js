@@ -449,6 +449,41 @@ function mergeActivityBatch(activity, batch) {
     return merged;
 }
 
+function clearActivityPlayer(activity, playerKeyRaw) {
+    const playerKey = String(playerKeyRaw || '').trim();
+    const next = normalizeActivityState(activity);
+    if (!playerKey) {
+        return {
+            activity: next,
+            removedPlayer: false,
+            removedBuckets: 0,
+            removedAny: false
+        };
+    }
+    let removedBuckets = 0;
+    Object.keys(next.buckets).forEach((idKey) => {
+        const rec = next.buckets[idKey];
+        if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
+            return;
+        }
+        if (String(rec.playerKey || '') !== playerKey) {
+            return;
+        }
+        delete next.buckets[idKey];
+        removedBuckets += 1;
+    });
+    const removedPlayer = Object.prototype.hasOwnProperty.call(next.players, playerKey);
+    if (removedPlayer) {
+        delete next.players[playerKey];
+    }
+    return {
+        activity: next,
+        removedPlayer: removedPlayer,
+        removedBuckets: removedBuckets,
+        removedAny: removedPlayer || removedBuckets > 0
+    };
+}
+
 function buildSharedCoordsFromActivity(activity) {
     const shared = {};
     if (!activity || typeof activity !== 'object' || Array.isArray(activity)) {
@@ -742,6 +777,15 @@ function parseUpdatePayload(payload) {
         }
     }
 
+    if (Object.prototype.hasOwnProperty.call(payload, 'activityClearPlayerKey')) {
+        const playerKey = String(payload.activityClearPlayerKey || '').trim();
+        if (playerKey) {
+            update.activityClearPlayerKey = playerKey;
+            const clearTs = safeNumber(payload.activityUpdatedAt, Date.now());
+            update.activityUpdatedAt = Math.max(safeNumber(update.activityUpdatedAt, 0), clearTs);
+        }
+    }
+
     if (Object.prototype.hasOwnProperty.call(payload, 'coordsBatch')) {
         const batch = normalizeSharedCoordsBatch(payload.coordsBatch);
         if (batch.length > 0) {
@@ -804,6 +848,7 @@ const server = http.createServer(async (req, res) => {
         }
         let stateChanged = false;
         let lockResult = null;
+        let clearActivityResult = null;
         if (Object.prototype.hasOwnProperty.call(update, 'targets')) {
             state.targets = update.targets;
             state.updatedAt = update.updatedAt;
@@ -818,6 +863,24 @@ const server = http.createServer(async (req, res) => {
             state.activity = mergeActivityBatch(state.activity, update.activityBatch);
             state.activityUpdatedAt = update.activityUpdatedAt;
             stateChanged = true;
+        }
+        if (Object.prototype.hasOwnProperty.call(update, 'activityClearPlayerKey')) {
+            const clearResult = clearActivityPlayer(state.activity, update.activityClearPlayerKey);
+            clearActivityResult = {
+                playerKey: update.activityClearPlayerKey,
+                removedPlayer: clearResult.removedPlayer,
+                removedBuckets: clearResult.removedBuckets,
+                removedAny: clearResult.removedAny
+            };
+            if (clearResult.removedAny) {
+                state.activity = clearResult.activity;
+                state.activityUpdatedAt = Math.max(safeNumber(state.activityUpdatedAt, 0), safeNumber(update.activityUpdatedAt, Date.now()));
+                if (Object.prototype.hasOwnProperty.call(state.sharedCoords, update.activityClearPlayerKey)) {
+                    delete state.sharedCoords[update.activityClearPlayerKey];
+                    state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), safeNumber(update.activityUpdatedAt, Date.now()));
+                }
+                stateChanged = true;
+            }
         }
         if (Object.prototype.hasOwnProperty.call(update, 'coordsBatch')) {
             state.sharedCoords = mergeSharedCoordsBatch(state.sharedCoords, update.coordsBatch);
@@ -838,6 +901,9 @@ const server = http.createServer(async (req, res) => {
         const response = buildPublicState(false);
         if (lockResult) {
             response.lockResult = lockResult;
+        }
+        if (clearActivityResult) {
+            response.clearActivityResult = clearActivityResult;
         }
         sendJson(res, 200, response);
     } catch (err) {
