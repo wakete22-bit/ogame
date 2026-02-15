@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.35
+// @version      0.7.36
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -89,6 +89,8 @@
     const HISTORY_BRIDGE_REQUEST = 'ptreLocalHistoryRemoteRequest';
     const HISTORY_BRIDGE_RESPONSE = 'ptreLocalHistoryRemoteResponse';
     const HISTORY_BRIDGE_TIMEOUT_MS = 12000;
+    const TARGETS_BRIDGE_REQUEST = 'ptreLocalTargetsBridgeRequest';
+    const TARGETS_BRIDGE_RESPONSE = 'ptreLocalTargetsBridgeResponse';
 
     const isLobby = location.hostname === 'lobby.ogame.gameforge.com' || /\/lobby/i.test(location.pathname);
     if (isLobby) {
@@ -1055,7 +1057,9 @@
             if (!data || typeof data !== 'object' || Array.isArray(data)) {
                 return;
             }
-            if (data.type !== HISTORY_BRIDGE_REQUEST) {
+            const isHistoryReq = data.type === HISTORY_BRIDGE_REQUEST;
+            const isTargetsReq = data.type === TARGETS_BRIDGE_REQUEST;
+            if (!isHistoryReq && !isTargetsReq) {
                 return;
             }
             const reqId = String(data.reqId || '').trim();
@@ -1063,10 +1067,11 @@
             if (!reqId || !sourceWin || typeof sourceWin.postMessage !== 'function') {
                 return;
             }
+            const responseType = isHistoryReq ? HISTORY_BRIDGE_RESPONSE : TARGETS_BRIDGE_RESPONSE;
             const reply = (payload, error) => {
                 try {
                     sourceWin.postMessage({
-                        type: HISTORY_BRIDGE_RESPONSE,
+                        type: responseType,
                         reqId: reqId,
                         payload: payload || null,
                         error: error ? String(error) : ''
@@ -1076,19 +1081,66 @@
                 }
             };
 
-            if (!isSyncHost()) {
-                reply(null, 'modo host requerido');
-                return;
-            }
-            if (!isSyncConfigured()) {
-                reply(null, 'sync no configurado');
+            if (isHistoryReq) {
+                if (!isSyncHost()) {
+                    reply(null, 'modo host requerido');
+                    return;
+                }
+                if (!isSyncConfigured()) {
+                    reply(null, 'sync no configurado');
+                    return;
+                }
+                const activityUrl = buildRemoteActivitySyncUrl();
+                requestSyncJson('GET', undefined, { url: activityUrl })
+                    .then((payload) => reply(payload, ''))
+                    .catch((err) => reply(null, err && err.message ? err.message : 'sync error'));
                 return;
             }
 
-            const activityUrl = buildRemoteActivitySyncUrl();
-            requestSyncJson('GET', undefined, { url: activityUrl })
-                .then((payload) => reply(payload, ''))
-                .catch((err) => reply(null, err && err.message ? err.message : 'sync error'));
+            const action = String(data.action || '').trim().toLowerCase();
+            if (action === 'get') {
+                reply({
+                    targets: loadTargets(),
+                    canEdit: canEditSharedTargets()
+                }, '');
+                return;
+            }
+            if (action === 'setprimary') {
+                if (!canEditSharedTargets()) {
+                    reply(null, getEditBlockedMessage() || 'edicion bloqueada');
+                    return;
+                }
+                const playerKey = String(data.playerKey || '').trim();
+                if (!playerKey) {
+                    reply(null, 'playerKey requerido');
+                    return;
+                }
+                const coordRaw = String(data.coord || '').trim();
+                const coord = coordRaw ? normalizeCoord(coordRaw) : '';
+                if (coordRaw && !coord) {
+                    reply(null, 'coordenada invalida');
+                    return;
+                }
+                const targets = loadTargets();
+                if (!targets[playerKey]) {
+                    reply(null, 'jugador no es objetivo');
+                    return;
+                }
+                if (coord) {
+                    targets[playerKey].primaryCoord = coord;
+                } else {
+                    delete targets[playerKey].primaryCoord;
+                }
+                saveTargets(targets);
+                updateTargetPanel();
+                reply({
+                    ok: true,
+                    playerKey: playerKey,
+                    primaryCoord: coord || ''
+                }, '');
+                return;
+            }
+            reply(null, 'accion no soportada');
         });
     }
 
@@ -2896,6 +2948,7 @@ th.row-title { z-index: 4; }
 #controls button { background: #25303a; color: #d7dee5; border: 1px solid #000; padding: 2px 6px; cursor: pointer; }
 #controls .danger { background: #5c1a1a; }
 .cell-planet span, .cell-moon span, .cell-debris span { padding: 0 4px; border-radius: 2px; display: inline-block; }
+.primary-tag { color: #ffcf66; font-style: italic; display: inline-block; margin-top: 2px; }
 .bg-red { background: #d43635; color: #fff; }
 .bg-yellow { background: #d2a900; color: #111; }
 .bg-green { background: #2e7d32; color: #fff; }
@@ -2913,6 +2966,11 @@ th.row-title { z-index: 4; }
   <label>Fecha:
     <select id="dateSelect" disabled>
       <option value="">-- Selecciona --</option>
+    </select>
+  </label>
+  <label>Principal:
+    <select id="primaryCoordSelect" disabled>
+      <option value="">-- Sin principal --</option>
     </select>
   </label>
   <button id="datePrev" title="Anterior">&lt;</button>
@@ -2933,6 +2991,8 @@ th.row-title { z-index: 4; }
     const REMOTE_HISTORY_ONLY = ${JSON.stringify(isSyncHost())};
     const HISTORY_BRIDGE_REQUEST = ${JSON.stringify(HISTORY_BRIDGE_REQUEST)};
     const HISTORY_BRIDGE_RESPONSE = ${JSON.stringify(HISTORY_BRIDGE_RESPONSE)};
+    const TARGETS_BRIDGE_REQUEST = ${JSON.stringify(TARGETS_BRIDGE_REQUEST)};
+    const TARGETS_BRIDGE_RESPONSE = ${JSON.stringify(TARGETS_BRIDGE_RESPONSE)};
     const HISTORY_BRIDGE_TIMEOUT_MS = ${HISTORY_BRIDGE_TIMEOUT_MS};
     const REMOTE_REFRESH_MS = 15000;
     let remoteDataset = { players: [], buckets: [] };
@@ -2999,6 +3059,22 @@ th.row-title { z-index: 4; }
         return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
     }
 
+    function compareCoords(a, b) {
+        const pa = String(a || '').split(':').map((part) => Number(part));
+        const pb = String(b || '').split(':').map((part) => Number(part));
+        if (pa.length !== 3 || pb.length !== 3) {
+            return String(a || '').localeCompare(String(b || ''));
+        }
+        for (let i = 0; i < 3; i += 1) {
+            const na = Number.isFinite(pa[i]) ? pa[i] : 0;
+            const nb = Number.isFinite(pb[i]) ? pb[i] : 0;
+            if (na !== nb) {
+                return na - nb;
+            }
+        }
+        return 0;
+    }
+
     function setRootMessage(root, text) {
         root.innerHTML = '';
         const line = document.createElement('div');
@@ -3053,6 +3129,58 @@ th.row-title { z-index: 4; }
                 clearTimeout(timer);
                 window.removeEventListener('message', onMessage);
                 reject(new Error('no se pudo pedir datos al master'));
+            }
+        });
+    }
+
+    function requestTargetsPayloadThroughBridge(action, payload) {
+        return new Promise((resolve, reject) => {
+            if (!window.opener || window.opener.closed) {
+                reject(new Error('ventana origen no disponible'));
+                return;
+            }
+            const reqId = String(Date.now()) + '-' + Math.random().toString(36).slice(2, 8);
+            let done = false;
+            const timer = setTimeout(() => {
+                if (done) {
+                    return;
+                }
+                done = true;
+                window.removeEventListener('message', onMessage);
+                reject(new Error('timeout bridge'));
+            }, HISTORY_BRIDGE_TIMEOUT_MS);
+            const onMessage = (event) => {
+                const data = event && event.data;
+                if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                    return;
+                }
+                if (data.type !== TARGETS_BRIDGE_RESPONSE || data.reqId !== reqId) {
+                    return;
+                }
+                if (done) {
+                    return;
+                }
+                done = true;
+                clearTimeout(timer);
+                window.removeEventListener('message', onMessage);
+                if (data.error) {
+                    reject(new Error(String(data.error)));
+                    return;
+                }
+                resolve(data.payload || {});
+            };
+            window.addEventListener('message', onMessage);
+            try {
+                const body = payload && typeof payload === 'object' ? payload : {};
+                window.opener.postMessage(Object.assign({
+                    type: TARGETS_BRIDGE_REQUEST,
+                    reqId: reqId,
+                    action: String(action || '')
+                }, body), '*');
+            } catch (err) {
+                clearTimeout(timer);
+                window.removeEventListener('message', onMessage);
+                reject(new Error('no se pudo pedir datos de objetivos'));
             }
         });
     }
@@ -3236,6 +3364,45 @@ th.row-title { z-index: 4; }
         });
     }
 
+    async function loadCoordsForPlayer(source, playerKey) {
+        if (REMOTE_HISTORY_ONLY) {
+            const coords = new Set();
+            const list = Array.isArray(source.buckets) ? source.buckets : [];
+            list.forEach((rec) => {
+                if (rec.playerKey !== playerKey) {
+                    return;
+                }
+                const coord = String(rec.coords || '').trim();
+                if (!coord || coord === 'unknown') {
+                    return;
+                }
+                coords.add(coord);
+            });
+            return Array.from(coords).sort(compareCoords);
+        }
+        return new Promise((resolve, reject) => {
+            const tx = source.transaction([STORE_BUCKETS], 'readonly');
+            const store = tx.objectStore(STORE_BUCKETS);
+            const idx = store.index('byPlayer');
+            const coords = new Set();
+            const req = idx.openCursor(IDBKeyRange.only(playerKey));
+            req.onsuccess = () => {
+                const cursor = req.result;
+                if (!cursor) {
+                    resolve(Array.from(coords).sort(compareCoords));
+                    return;
+                }
+                const val = cursor.value;
+                const coord = String(val.coords || '').trim();
+                if (coord && coord !== 'unknown') {
+                    coords.add(coord);
+                }
+                cursor.continue();
+            };
+            req.onerror = () => reject(req.error);
+        });
+    }
+
     async function loadBucketsForPlayer(source, playerKey, startTs, endTs) {
         if (REMOTE_HISTORY_ONLY) {
             const list = Array.isArray(source.buckets) ? source.buckets : [];
@@ -3380,6 +3547,11 @@ th.row-title { z-index: 4; }
                 '<option value="">-- Selecciona --</option>' +
               '</select>' +
             '</label>' +
+            '<label>Principal:' +
+              '<select id="primaryCoordSelect" disabled>' +
+                '<option value="">-- Sin principal --</option>' +
+              '</select>' +
+            '</label>' +
             '<button id="datePrev" title="Anterior">&lt;</button>' +
             '<button id="dateToday" title="Hoy">Hoy</button>' +
             '<button id="dateNext" title="Siguiente">&gt;</button>' +
@@ -3397,6 +3569,7 @@ th.row-title { z-index: 4; }
         const root = document.getElementById('root');
         const playerSelect = document.getElementById('playerSelect');
         const dateSelect = document.getElementById('dateSelect');
+        const primaryCoordSelect = document.getElementById('primaryCoordSelect');
         const datePrev = document.getElementById('datePrev');
         const dateToday = document.getElementById('dateToday');
         const dateNext = document.getElementById('dateNext');
@@ -3409,6 +3582,81 @@ th.row-title { z-index: 4; }
                 : 'Selecciona jugador y fecha.';
         }
 
+        let primarySelectUpdating = false;
+        let targetsState = {
+            targets: {},
+            canEdit: false
+        };
+
+        const resetPrimarySelect = () => {
+            if (!primaryCoordSelect) {
+                return;
+            }
+            primarySelectUpdating = true;
+            primaryCoordSelect.innerHTML = '<option value="">-- Sin principal --</option>';
+            primaryCoordSelect.value = '';
+            primaryCoordSelect.disabled = true;
+            primarySelectUpdating = false;
+        };
+
+        const refreshTargetsState = async () => {
+            try {
+                const payload = await requestTargetsPayloadThroughBridge('get');
+                targetsState.targets = payload && payload.targets && typeof payload.targets === 'object'
+                    ? payload.targets
+                    : {};
+                targetsState.canEdit = Boolean(payload && payload.canEdit);
+            } catch (err) {
+                targetsState.targets = {};
+                targetsState.canEdit = false;
+            }
+        };
+
+        const getPrimaryCoordForPlayer = (playerKey) => {
+            if (!playerKey) {
+                return '';
+            }
+            const rec = targetsState.targets[playerKey];
+            if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
+                return '';
+            }
+            const coord = String(rec.primaryCoord || '').trim();
+            return coord;
+        };
+
+        const populatePrimarySelect = async (sourceNow, playerKey) => {
+            if (!primaryCoordSelect) {
+                return;
+            }
+            resetPrimarySelect();
+            if (!playerKey) {
+                return;
+            }
+            let coords = [];
+            try {
+                coords = await loadCoordsForPlayer(sourceNow, playerKey);
+            } catch (err) {
+                coords = [];
+            }
+            const primaryCoord = getPrimaryCoordForPlayer(playerKey);
+            const set = new Set(coords);
+            if (primaryCoord) {
+                set.add(primaryCoord);
+            }
+            const ordered = Array.from(set).sort(compareCoords);
+            primarySelectUpdating = true;
+            primaryCoordSelect.innerHTML = '<option value="">-- Sin principal --</option>';
+            ordered.forEach((coord) => {
+                const opt = document.createElement('option');
+                opt.value = coord;
+                opt.textContent = coord;
+                primaryCoordSelect.appendChild(opt);
+            });
+            primaryCoordSelect.value = primaryCoord && ordered.includes(primaryCoord) ? primaryCoord : '';
+            primaryCoordSelect.disabled = !targetsState.canEdit;
+            primarySelectUpdating = false;
+        };
+
         let source;
         try {
             source = await getSource({ forceRemote: true });
@@ -3416,10 +3664,12 @@ th.row-title { z-index: 4; }
             playerSelect.innerHTML = '<option value="">-- Selecciona --</option>';
             dateSelect.innerHTML = '<option value="">-- Selecciona --</option>';
             dateSelect.disabled = true;
+            resetPrimarySelect();
             setRootMessage(root, 'Error cargando historial remoto: ' + (err && err.message ? err.message : 'desconocido'));
             return;
         }
 
+        await refreshTargetsState();
         const players = await loadPlayers(source);
         players.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
 
@@ -3443,6 +3693,7 @@ th.row-title { z-index: 4; }
                 dateSelect.disabled = true;
                 const key = playerSelect.value;
                 if (!key) {
+                    resetPrimarySelect();
                     return;
                 }
                 let sourceNow;
@@ -3452,6 +3703,8 @@ th.row-title { z-index: 4; }
                     setRootMessage(root, 'Error cargando fechas: ' + (err && err.message ? err.message : 'desconocido'));
                     return;
                 }
+                await refreshTargetsState();
+                await populatePrimarySelect(sourceNow, key);
                 const dates = await loadDatesForPlayer(sourceNow, key);
                 dates.forEach((d) => {
                     const opt = document.createElement('option');
@@ -3460,6 +3713,47 @@ th.row-title { z-index: 4; }
                     dateSelect.appendChild(opt);
                 });
                 dateSelect.disabled = false;
+            });
+        }
+
+        if (primaryCoordSelect && !primaryCoordSelect.dataset.bound) {
+            primaryCoordSelect.dataset.bound = 'true';
+            primaryCoordSelect.addEventListener('change', async () => {
+                if (primarySelectUpdating) {
+                    return;
+                }
+                const playerKey = playerSelect.value;
+                if (!playerKey) {
+                    return;
+                }
+                const coord = String(primaryCoordSelect.value || '').trim();
+                primaryCoordSelect.disabled = true;
+                try {
+                    const payload = await requestTargetsPayloadThroughBridge('setPrimary', {
+                        playerKey: playerKey,
+                        coord: coord
+                    });
+                    if (!targetsState.targets[playerKey] || typeof targetsState.targets[playerKey] !== 'object') {
+                        targetsState.targets[playerKey] = { name: playerKey };
+                    }
+                    const finalCoord = payload && typeof payload.primaryCoord === 'string'
+                        ? String(payload.primaryCoord || '').trim()
+                        : coord;
+                    if (finalCoord) {
+                        targetsState.targets[playerKey].primaryCoord = finalCoord;
+                    } else {
+                        delete targetsState.targets[playerKey].primaryCoord;
+                    }
+                    if (dateSelect.value) {
+                        dateSelect.dispatchEvent(new Event('change'));
+                    }
+                } catch (err) {
+                    window.alert('No se pudo guardar principal: ' + (err && err.message ? err.message : 'error'));
+                } finally {
+                    if (playerSelect.value) {
+                        primaryCoordSelect.disabled = !targetsState.canEdit;
+                    }
+                }
             });
         }
 
@@ -3496,6 +3790,7 @@ th.row-title { z-index: 4; }
                     }
                     bucketsByCoord.get(coord)[rec.bucketTs] = rec;
                 });
+                const primaryCoord = getPrimaryCoordForPlayer(playerKey);
 
                 let html = '';
                 html += '<div class="player-block">';
@@ -3507,9 +3802,10 @@ th.row-title { z-index: 4; }
                 }
                 html += '</tr></thead><tbody>';
 
-                const coordsList = Array.from(bucketsByCoord.keys()).filter((coord) => coord !== 'unknown').sort();
+                const coordsList = Array.from(bucketsByCoord.keys()).filter((coord) => coord !== 'unknown').sort(compareCoords);
                 for (const coord of coordsList) {
-                    html += '<tr><td class="row-title">' + coord + '</td>';
+                    const label = coord + (primaryCoord && coord === primaryCoord ? '<br><span class="primary-tag">*Principal*</span>' : '');
+                    html += '<tr><td class="row-title">' + label + '</td>';
                     for (const t of bucketTimes) {
                         const rec = bucketsByCoord.get(coord)[t];
                         const content = formatCell(rec);
@@ -3543,8 +3839,9 @@ th.row-title { z-index: 4; }
         }
         if (refreshNow && !refreshNow.dataset.bound) {
             refreshNow.dataset.bound = 'true';
-            refreshNow.addEventListener('click', () => {
+            refreshNow.addEventListener('click', async () => {
                 root.innerHTML = '';
+                await refreshTargetsState();
                 if (playerSelect.value && dateSelect.value) {
                     dateSelect.dispatchEvent(new Event('change'));
                     return;
@@ -3576,6 +3873,7 @@ th.row-title { z-index: 4; }
                 playerSelect.value = '';
                 dateSelect.value = '';
                 dateSelect.disabled = true;
+                resetPrimarySelect();
                 root.innerHTML = '';
                 render();
             });
@@ -3583,6 +3881,7 @@ th.row-title { z-index: 4; }
 
         if (!playerSelect.value) {
             root.innerHTML = '';
+            resetPrimarySelect();
         }
     }
 
