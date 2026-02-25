@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.39
+// @version      0.7.40
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -1101,15 +1101,11 @@
             if (action === 'get') {
                 reply({
                     targets: loadTargets(),
-                    canEdit: canEditSharedTargets()
+                    canSetPrimary: true
                 }, '');
                 return;
             }
             if (action === 'setprimary') {
-                if (!canEditSharedTargets()) {
-                    reply(null, getEditBlockedMessage() || 'edicion bloqueada');
-                    return;
-                }
                 const playerKey = String(data.playerKey || '').trim();
                 if (!playerKey) {
                     reply(null, 'playerKey requerido');
@@ -3673,7 +3669,7 @@ th.row-title { z-index: 4; }
         let primarySelectUpdating = false;
         let targetsState = {
             targets: {},
-            canEdit: false
+            canSetPrimary: false
         };
 
         const resetPrimarySelect = () => {
@@ -3693,10 +3689,10 @@ th.row-title { z-index: 4; }
                 targetsState.targets = payload && payload.targets && typeof payload.targets === 'object'
                     ? payload.targets
                     : {};
-                targetsState.canEdit = Boolean(payload && payload.canEdit);
+                targetsState.canSetPrimary = Boolean(payload && payload.canSetPrimary);
             } catch (err) {
                 targetsState.targets = {};
-                targetsState.canEdit = false;
+                targetsState.canSetPrimary = false;
             }
         };
 
@@ -3741,7 +3737,7 @@ th.row-title { z-index: 4; }
                 primaryCoordSelect.appendChild(opt);
             });
             primaryCoordSelect.value = primaryCoord && ordered.includes(primaryCoord) ? primaryCoord : '';
-            primaryCoordSelect.disabled = !targetsState.canEdit;
+            primaryCoordSelect.disabled = !targetsState.canSetPrimary;
             primarySelectUpdating = false;
         };
 
@@ -3843,7 +3839,7 @@ th.row-title { z-index: 4; }
                     window.alert('No se pudo guardar principal: ' + (err && err.message ? err.message : 'error'));
                 } finally {
                     if (playerSelect.value) {
-                        primaryCoordSelect.disabled = !targetsState.canEdit;
+                        primaryCoordSelect.disabled = !targetsState.canSetPrimary;
                     }
                 }
             });
