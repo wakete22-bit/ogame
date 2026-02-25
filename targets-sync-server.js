@@ -484,6 +484,84 @@ function clearActivityPlayer(activity, playerKeyRaw) {
     };
 }
 
+function buildTargetKeySet(targets) {
+    return new Set(Object.keys(normalizeTargets(targets)));
+}
+
+function filterActivityBatchByTargets(batch, targets) {
+    if (!Array.isArray(batch) || !batch.length) {
+        return [];
+    }
+    const targetSet = buildTargetKeySet(targets);
+    if (!targetSet.size) {
+        return [];
+    }
+    return batch.filter((obs) => targetSet.has(obs.playerKey));
+}
+
+function filterCoordsBatchByTargets(batch, targets) {
+    if (!Array.isArray(batch) || !batch.length) {
+        return [];
+    }
+    const targetSet = buildTargetKeySet(targets);
+    if (!targetSet.size) {
+        return [];
+    }
+    return batch.filter((obs) => targetSet.has(obs.playerKey));
+}
+
+function pruneActivityByTargets(activity, targets) {
+    const next = normalizeActivityState(activity);
+    const targetSet = buildTargetKeySet(targets);
+    let removedPlayers = 0;
+    let removedBuckets = 0;
+
+    Object.keys(next.players).forEach((playerKey) => {
+        if (targetSet.has(playerKey)) {
+            return;
+        }
+        delete next.players[playerKey];
+        removedPlayers += 1;
+    });
+
+    Object.keys(next.buckets).forEach((idKey) => {
+        const rec = next.buckets[idKey];
+        const playerKey = String(rec && rec.playerKey ? rec.playerKey : '').trim();
+        if (targetSet.has(playerKey)) {
+            return;
+        }
+        delete next.buckets[idKey];
+        removedBuckets += 1;
+    });
+
+    return {
+        activity: next,
+        removedPlayers: removedPlayers,
+        removedBuckets: removedBuckets,
+        removedAny: removedPlayers > 0 || removedBuckets > 0
+    };
+}
+
+function pruneSharedCoordsByTargets(sharedCoords, targets) {
+    const next = normalizeSharedCoordsState(sharedCoords);
+    const targetSet = buildTargetKeySet(targets);
+    let removedPlayers = 0;
+
+    Object.keys(next).forEach((playerKey) => {
+        if (targetSet.has(playerKey)) {
+            return;
+        }
+        delete next[playerKey];
+        removedPlayers += 1;
+    });
+
+    return {
+        sharedCoords: next,
+        removedPlayers: removedPlayers,
+        removedAny: removedPlayers > 0
+    };
+}
+
 function buildSharedCoordsFromActivity(activity) {
     const shared = {};
     if (!activity || typeof activity !== 'object' || Array.isArray(activity)) {
@@ -575,6 +653,20 @@ function loadState() {
 }
 
 let state = loadState();
+const startupPrunedActivity = pruneActivityByTargets(state.activity, state.targets);
+const startupPrunedSharedCoords = pruneSharedCoordsByTargets(state.sharedCoords, state.targets);
+if (startupPrunedActivity.removedAny || startupPrunedSharedCoords.removedAny) {
+    const startupNow = Date.now();
+    if (startupPrunedActivity.removedAny) {
+        state.activity = startupPrunedActivity.activity;
+        state.activityUpdatedAt = Math.max(safeNumber(state.activityUpdatedAt, 0), startupNow);
+    }
+    if (startupPrunedSharedCoords.removedAny) {
+        state.sharedCoords = startupPrunedSharedCoords.sharedCoords;
+        state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), startupNow);
+    }
+    persistState();
+}
 
 function persistState() {
     const tmpFile = DATA_FILE + '.tmp';
@@ -852,6 +944,16 @@ const server = http.createServer(async (req, res) => {
         if (Object.prototype.hasOwnProperty.call(update, 'targets')) {
             state.targets = update.targets;
             state.updatedAt = update.updatedAt;
+            const prunedActivity = pruneActivityByTargets(state.activity, state.targets);
+            if (prunedActivity.removedAny) {
+                state.activity = prunedActivity.activity;
+                state.activityUpdatedAt = Math.max(safeNumber(state.activityUpdatedAt, 0), safeNumber(update.updatedAt, Date.now()));
+            }
+            const prunedSharedCoords = pruneSharedCoordsByTargets(state.sharedCoords, state.targets);
+            if (prunedSharedCoords.removedAny) {
+                state.sharedCoords = prunedSharedCoords.sharedCoords;
+                state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), safeNumber(update.updatedAt, Date.now()));
+            }
             stateChanged = true;
         }
         if (Object.prototype.hasOwnProperty.call(update, 'control')) {
@@ -860,9 +962,12 @@ const server = http.createServer(async (req, res) => {
             stateChanged = true;
         }
         if (Object.prototype.hasOwnProperty.call(update, 'activityBatch')) {
-            state.activity = mergeActivityBatch(state.activity, update.activityBatch);
-            state.activityUpdatedAt = update.activityUpdatedAt;
-            stateChanged = true;
+            const allowedBatch = filterActivityBatchByTargets(update.activityBatch, state.targets);
+            if (allowedBatch.length > 0) {
+                state.activity = mergeActivityBatch(state.activity, allowedBatch);
+                state.activityUpdatedAt = update.activityUpdatedAt;
+                stateChanged = true;
+            }
         }
         if (Object.prototype.hasOwnProperty.call(update, 'activityClearPlayerKey')) {
             const clearResult = clearActivityPlayer(state.activity, update.activityClearPlayerKey);
@@ -883,9 +988,12 @@ const server = http.createServer(async (req, res) => {
             }
         }
         if (Object.prototype.hasOwnProperty.call(update, 'coordsBatch')) {
-            state.sharedCoords = mergeSharedCoordsBatch(state.sharedCoords, update.coordsBatch);
-            state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), update.coordsUpdatedAt);
-            stateChanged = true;
+            const allowedBatch = filterCoordsBatchByTargets(update.coordsBatch, state.targets);
+            if (allowedBatch.length > 0) {
+                state.sharedCoords = mergeSharedCoordsBatch(state.sharedCoords, allowedBatch);
+                state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), update.coordsUpdatedAt);
+                stateChanged = true;
+            }
         }
         if (Object.prototype.hasOwnProperty.call(update, 'editLockCommand')) {
             const beforeLock = state.editLock ? JSON.stringify(state.editLock) : '';

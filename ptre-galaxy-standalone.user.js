@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.38
+// @version      0.7.39
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -2520,10 +2520,53 @@
         return {};
     }
 
+    function pruneLocalHistoryByTargets(targets) {
+        const allowedKeys = new Set(Object.keys(normalizeTargets(targets)));
+        dbQueue = dbQueue.then(() => openDb().then((db) => new Promise((resolve, reject) => {
+            const tx = db.transaction([STORE_PLAYERS, STORE_BUCKETS], 'readwrite');
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error || new Error('tx abort'));
+
+            const players = tx.objectStore(STORE_PLAYERS);
+            const buckets = tx.objectStore(STORE_BUCKETS);
+
+            const playersReq = players.openCursor();
+            playersReq.onsuccess = () => {
+                const cursor = playersReq.result;
+                if (!cursor) {
+                    return;
+                }
+                const playerKey = String(cursor.primaryKey || '').trim();
+                if (!allowedKeys.has(playerKey)) {
+                    players.delete(cursor.primaryKey);
+                }
+                cursor.continue();
+            };
+            playersReq.onerror = () => reject(playersReq.error);
+
+            const bucketsReq = buckets.openCursor();
+            bucketsReq.onsuccess = () => {
+                const cursor = bucketsReq.result;
+                if (!cursor) {
+                    return;
+                }
+                const rec = cursor.value;
+                const playerKey = String(rec && rec.playerKey ? rec.playerKey : '').trim();
+                if (!allowedKeys.has(playerKey)) {
+                    buckets.delete(cursor.primaryKey);
+                }
+                cursor.continue();
+            };
+            bucketsReq.onerror = () => reject(bucketsReq.error);
+        }))).catch(() => {});
+    }
+
     function saveTargets(targets, options) {
         const opts = options || {};
         const normalized = normalizeTargets(targets);
         GM_setValue(KEY_TARGETS, JSON.stringify(normalized));
+        pruneLocalHistoryByTargets(normalized);
         if (!opts.skipSync && canPushTargetsSync()) {
             queueHostTargetsSync(normalized);
         }
@@ -3715,7 +3758,11 @@ th.row-title { z-index: 4; }
         }
 
         await refreshTargetsState();
-        const players = await loadPlayers(source);
+        const allowedTargetKeys = new Set(Object.keys(targetsState.targets || {}));
+        const players = (await loadPlayers(source)).filter((player) => {
+            const key = String(player && player.playerKey ? player.playerKey : '').trim();
+            return allowedTargetKeys.has(key);
+        });
         players.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
 
         const currentPlayer = playerSelect.value;
