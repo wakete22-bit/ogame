@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.40
+// @version      0.7.41
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -84,11 +84,11 @@
     const SYNC_COORDS_MAX_QUEUE = 1500;
     const SYNC_EDIT_LOCK_TTL_MS = 2 * 60 * 1000;
     const SYNC_EDIT_LOCK_HEARTBEAT_MS = 45 * 1000;
-    const SYNC_HTTP_TIMEOUT_MS = 10000;
+    const SYNC_HTTP_TIMEOUT_MS = 15000;
     const SYNC_TOKEN_HEADER = 'x-ptre-token';
     const HISTORY_BRIDGE_REQUEST = 'ptreLocalHistoryRemoteRequest';
     const HISTORY_BRIDGE_RESPONSE = 'ptreLocalHistoryRemoteResponse';
-    const HISTORY_BRIDGE_TIMEOUT_MS = 12000;
+    const HISTORY_BRIDGE_TIMEOUT_MS = 45000;
     const TARGETS_BRIDGE_REQUEST = 'ptreLocalTargetsBridgeRequest';
     const TARGETS_BRIDGE_RESPONSE = 'ptreLocalTargetsBridgeResponse';
 
@@ -978,6 +978,34 @@
         return appendQueryParam(syncEndpoint, 'includeActivity', '1');
     }
 
+    function buildRemoteActivitySummarySyncUrl() {
+        let url = appendQueryParam(syncEndpoint, 'historyOnly', '1');
+        url = appendQueryParam(url, 'activitySummary', '1');
+        return url;
+    }
+
+    function buildRemoteActivityMetaSyncUrl(playerKey) {
+        let url = appendQueryParam(syncEndpoint, 'historyOnly', '1');
+        url = appendQueryParam(url, 'activityMeta', '1');
+        url = appendQueryParam(url, 'activityPlayerKey', String(playerKey || '').trim());
+        return url;
+    }
+
+    function buildRemoteActivityPlayerSyncUrl(playerKey, startTs, endTs, limit) {
+        let url = appendQueryParam(syncEndpoint, 'historyOnly', '1');
+        url = appendQueryParam(url, 'activityPlayerKey', String(playerKey || '').trim());
+        if (Number.isFinite(startTs) && startTs > 0) {
+            url = appendQueryParam(url, 'activityStartTs', String(Math.floor(startTs)));
+        }
+        if (Number.isFinite(endTs) && endTs > 0) {
+            url = appendQueryParam(url, 'activityEndTs', String(Math.floor(endTs)));
+        }
+        if (Number.isFinite(limit) && limit > 0) {
+            url = appendQueryParam(url, 'activityLimit', String(Math.floor(limit)));
+        }
+        return url;
+    }
+
     function requestSyncJson(method, payload, options) {
         const opts = options && typeof options === 'object' ? options : {};
         const requestUrl = String(opts.url || syncEndpoint || '').trim();
@@ -1047,6 +1075,35 @@
         });
     }
 
+    function waitMs(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function isRetryableSyncError(err) {
+        const msg = String(err && err.message ? err.message : '').toLowerCase();
+        return msg.indexOf('timeout') !== -1 || msg.indexOf('network') !== -1;
+    }
+
+    function requestSyncJsonWithRetry(method, payload, options) {
+        const rawOpts = options && typeof options === 'object' ? options : {};
+        const retries = Math.max(0, Math.floor(Number(rawOpts.retries) || 0));
+        const retryDelayMs = Math.max(100, Math.floor(Number(rawOpts.retryDelayMs) || 400));
+        const reqOpts = Object.assign({}, rawOpts);
+        delete reqOpts.retries;
+        delete reqOpts.retryDelayMs;
+
+        const run = (attemptIdx) => {
+            return requestSyncJson(method, payload, reqOpts).catch((err) => {
+                if (attemptIdx > retries || !isRetryableSyncError(err)) {
+                    throw err;
+                }
+                return waitMs(retryDelayMs * attemptIdx).then(() => run(attemptIdx + 1));
+            });
+        };
+
+        return run(1);
+    }
+
     function ensureHistoryBridge() {
         if (historyBridgeBound) {
             return;
@@ -1090,8 +1147,41 @@
                     reply(null, 'sync no configurado');
                     return;
                 }
-                const activityUrl = buildRemoteActivitySyncUrl();
-                requestSyncJson('GET', undefined, { url: activityUrl })
+                const historyAction = String(data.action || 'full').trim().toLowerCase();
+                let activityUrl = '';
+                if (historyAction === 'summary') {
+                    activityUrl = buildRemoteActivitySummarySyncUrl();
+                } else if (historyAction === 'playermeta') {
+                    const playerKey = String(data.playerKey || '').trim();
+                    if (!playerKey) {
+                        reply(null, 'playerKey requerido');
+                        return;
+                    }
+                    activityUrl = buildRemoteActivityMetaSyncUrl(playerKey);
+                } else if (historyAction === 'player') {
+                    const playerKey = String(data.playerKey || '').trim();
+                    if (!playerKey) {
+                        reply(null, 'playerKey requerido');
+                        return;
+                    }
+                    const startTsRaw = Number(data.startTs || 0);
+                    const endTsRaw = Number(data.endTs || 0);
+                    const limitRaw = Number(data.limit || 0);
+                    const startTs = Number.isFinite(startTsRaw) && startTsRaw > 0 ? Math.floor(startTsRaw) : 0;
+                    const endTs = Number.isFinite(endTsRaw) && endTsRaw > 0 ? Math.floor(endTsRaw) : 0;
+                    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : 0;
+                    activityUrl = buildRemoteActivityPlayerSyncUrl(playerKey, startTs, endTs, limit);
+                } else if (historyAction === 'full') {
+                    activityUrl = buildRemoteActivitySyncUrl();
+                } else {
+                    reply(null, 'accion historial no soportada');
+                    return;
+                }
+                requestSyncJsonWithRetry('GET', undefined, {
+                    url: activityUrl,
+                    retries: 2,
+                    retryDelayMs: 500
+                })
                     .then((payload) => reply(payload, ''))
                     .catch((err) => reply(null, err && err.message ? err.message : 'sync error'));
                 return;
@@ -3071,6 +3161,14 @@ th.row-title { z-index: 4; }
     const REMOTE_REFRESH_MS = 15000;
     let remoteDataset = { players: [], buckets: [] };
     let remoteLoadedAt = 0;
+    let remotePlayerMetaByKey = new Map();
+    let remotePlayerBucketsByRange = new Map();
+
+    function clearRemoteHistoryCache() {
+        remoteLoadedAt = 0;
+        remotePlayerMetaByKey = new Map();
+        remotePlayerBucketsByRange = new Map();
+    }
 
     function openDb() {
         return openDbInternal(true);
@@ -3157,7 +3255,7 @@ th.row-title { z-index: 4; }
         root.appendChild(line);
     }
 
-    function requestRemotePayloadThroughBridge() {
+    function requestRemotePayloadThroughBridge(action, payload) {
         return new Promise((resolve, reject) => {
             if (!window.opener || window.opener.closed) {
                 reject(new Error('ventana master no disponible'));
@@ -3195,10 +3293,12 @@ th.row-title { z-index: 4; }
             };
             window.addEventListener('message', onMessage);
             try {
-                window.opener.postMessage({
+                const body = payload && typeof payload === 'object' ? payload : {};
+                window.opener.postMessage(Object.assign({
                     type: HISTORY_BRIDGE_REQUEST,
-                    reqId: reqId
-                }, '*');
+                    reqId: reqId,
+                    action: String(action || '')
+                }, body), '*');
             } catch (err) {
                 clearTimeout(timer);
                 window.removeEventListener('message', onMessage);
@@ -3378,9 +3478,60 @@ th.row-title { z-index: 4; }
         return data;
     }
 
+    function normalizeRemoteActivityMeta(payload, playerKey) {
+        const key = String(playerKey || '').trim();
+        const meta = {
+            playerKey: key,
+            dates: [],
+            coords: []
+        };
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            return meta;
+        }
+        const raw = payload.activityMeta;
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+            return meta;
+        }
+        const rawDates = Array.isArray(raw.dates) ? raw.dates : [];
+        const rawCoords = Array.isArray(raw.coords) ? raw.coords : [];
+        meta.dates = rawDates
+            .map((item) => String(item || '').trim())
+            .filter((item) => /^\\d{4}-\\d{2}-\\d{2}$/.test(item))
+            .sort();
+        meta.coords = rawCoords
+            .map((item) => String(item || '').trim())
+            .filter((item) => /^\\d+:\\d+:\\d+$/.test(item))
+            .sort(compareCoords);
+        return meta;
+    }
+
+    function remoteRangeCacheKey(playerKey, startTs, endTs) {
+        return String(playerKey || '').trim() + '|' + String(startTs || 0) + '|' + String(endTs || 0);
+    }
+
     async function fetchRemoteDataset() {
-        const payload = await requestRemotePayloadThroughBridge();
+        const payload = await requestRemotePayloadThroughBridge('summary');
         return normalizeRemoteDataset(payload);
+    }
+
+    async function fetchRemotePlayerMeta(playerKey) {
+        const payload = await requestRemotePayloadThroughBridge('playerMeta', {
+            playerKey: playerKey
+        });
+        return normalizeRemoteActivityMeta(payload, playerKey);
+    }
+
+    async function fetchRemoteBucketsForPlayer(playerKey, startTs, endTs) {
+        const payload = await requestRemotePayloadThroughBridge('player', {
+            playerKey: playerKey,
+            startTs: startTs,
+            endTs: endTs,
+            limit: 2000
+        });
+        const dataset = normalizeRemoteDataset(payload);
+        return dataset.buckets
+            .filter((rec) => rec.playerKey === playerKey && rec.bucketTs >= startTs && rec.bucketTs <= endTs)
+            .sort((a, b) => (a.bucketTs || 0) - (b.bucketTs || 0));
     }
 
     async function ensureRemoteDataset(forceRefresh) {
@@ -3394,6 +3545,43 @@ th.row-title { z-index: 4; }
         remoteDataset = await fetchRemoteDataset();
         remoteLoadedAt = now;
         return remoteDataset;
+    }
+
+    async function ensureRemotePlayerMeta(playerKey, forceRefresh) {
+        if (!REMOTE_HISTORY_ONLY) {
+            return { playerKey: String(playerKey || '').trim(), dates: [], coords: [] };
+        }
+        const key = String(playerKey || '').trim();
+        if (!key) {
+            return { playerKey: '', dates: [], coords: [] };
+        }
+        const now = Date.now();
+        const cached = remotePlayerMetaByKey.get(key);
+        if (!forceRefresh && cached && (now - cached.loadedAt) < REMOTE_REFRESH_MS) {
+            return cached.meta;
+        }
+        const meta = await fetchRemotePlayerMeta(key);
+        remotePlayerMetaByKey.set(key, { loadedAt: now, meta: meta });
+        return meta;
+    }
+
+    async function ensureRemoteBucketsForPlayer(playerKey, startTs, endTs, forceRefresh) {
+        if (!REMOTE_HISTORY_ONLY) {
+            return [];
+        }
+        const key = String(playerKey || '').trim();
+        if (!key) {
+            return [];
+        }
+        const rangeKey = remoteRangeCacheKey(key, startTs, endTs);
+        const now = Date.now();
+        const cached = remotePlayerBucketsByRange.get(rangeKey);
+        if (!forceRefresh && cached && (now - cached.loadedAt) < REMOTE_REFRESH_MS) {
+            return cached.buckets.slice();
+        }
+        const buckets = await fetchRemoteBucketsForPlayer(key, startTs, endTs);
+        remotePlayerBucketsByRange.set(rangeKey, { loadedAt: now, buckets: buckets.slice() });
+        return buckets.slice();
     }
 
     async function getSource(options) {
@@ -3419,14 +3607,8 @@ th.row-title { z-index: 4; }
 
     async function loadDatesForPlayer(source, playerKey) {
         if (REMOTE_HISTORY_ONLY) {
-            const dates = new Set();
-            const list = Array.isArray(source.buckets) ? source.buckets : [];
-            list.forEach((rec) => {
-                if (rec.playerKey === playerKey) {
-                    dates.add(dateKey(rec.bucketTs));
-                }
-            });
-            return Array.from(dates).sort();
+            const meta = await ensureRemotePlayerMeta(playerKey, false);
+            return Array.isArray(meta.dates) ? meta.dates.slice() : [];
         }
         return new Promise((resolve, reject) => {
             const tx = source.transaction([STORE_BUCKETS], 'readonly');
@@ -3450,19 +3632,8 @@ th.row-title { z-index: 4; }
 
     async function loadCoordsForPlayer(source, playerKey) {
         if (REMOTE_HISTORY_ONLY) {
-            const coords = new Set();
-            const list = Array.isArray(source.buckets) ? source.buckets : [];
-            list.forEach((rec) => {
-                if (rec.playerKey !== playerKey) {
-                    return;
-                }
-                const coord = String(rec.coords || '').trim();
-                if (!coord || coord === 'unknown') {
-                    return;
-                }
-                coords.add(coord);
-            });
-            return Array.from(coords).sort(compareCoords);
+            const meta = await ensureRemotePlayerMeta(playerKey, false);
+            return Array.isArray(meta.coords) ? meta.coords.slice() : [];
         }
         return new Promise((resolve, reject) => {
             const tx = source.transaction([STORE_BUCKETS], 'readonly');
@@ -3489,8 +3660,7 @@ th.row-title { z-index: 4; }
 
     async function loadBucketsForPlayer(source, playerKey, startTs, endTs) {
         if (REMOTE_HISTORY_ONLY) {
-            const list = Array.isArray(source.buckets) ? source.buckets : [];
-            return list.filter((rec) => rec.playerKey === playerKey && rec.bucketTs >= startTs && rec.bucketTs <= endTs);
+            return ensureRemoteBucketsForPlayer(playerKey, startTs, endTs, false);
         }
         return new Promise((resolve, reject) => {
             const tx = source.transaction([STORE_BUCKETS], 'readonly');
@@ -3786,7 +3956,7 @@ th.row-title { z-index: 4; }
                 }
                 let sourceNow;
                 try {
-                    sourceNow = await getSource({ forceRemote: REMOTE_HISTORY_ONLY });
+                    sourceNow = await getSource({ forceRemote: false });
                 } catch (err) {
                     setRootMessage(root, 'Error cargando fechas: ' + (err && err.message ? err.message : 'desconocido'));
                     return;
@@ -3864,7 +4034,7 @@ th.row-title { z-index: 4; }
 
                 let sourceNow;
                 try {
-                    sourceNow = await getSource({ forceRemote: REMOTE_HISTORY_ONLY });
+                    sourceNow = await getSource({ forceRemote: false });
                 } catch (err) {
                     setRootMessage(root, 'Error cargando datos: ' + (err && err.message ? err.message : 'desconocido'));
                     return;
@@ -3929,6 +4099,7 @@ th.row-title { z-index: 4; }
             refreshNow.dataset.bound = 'true';
             refreshNow.addEventListener('click', async () => {
                 root.innerHTML = '';
+                clearRemoteHistoryCache();
                 await refreshTargetsState();
                 if (playerSelect.value && dateSelect.value) {
                     dateSelect.dispatchEvent(new Event('change'));
@@ -3961,7 +4132,7 @@ th.row-title { z-index: 4; }
                 try {
                     if (REMOTE_HISTORY_ONLY) {
                         await clearHistoryForPlayerThroughBridge(playerKey);
-                        remoteLoadedAt = 0;
+                        clearRemoteHistoryCache();
                         await ensureRemoteDataset(true);
                     } else {
                         const dbNow = await getSource();
