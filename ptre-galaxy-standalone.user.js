@@ -30,6 +30,7 @@
     const KEY_SCAN_SPEED = 'ptreLocalScanSpeed';
     const KEY_CONTINUOUS_INTERVAL = 'ptreLocalContinuousInterval';
     const KEY_CONTINUOUS_ACTIVE = 'ptreLocalContinuousActive';
+    const KEY_SCAN_RESUME_PENDING = 'ptreLocalScanResumePending';
     const KEY_EXECUTE_ON_SLAVE = 'ptreLocalExecuteOnSlave';
     const KEY_LAST_REMOTE_CMD = 'ptreLocalLastRemoteCmd';
     const KEY_REMOTE_SCAN_PLAN = 'ptreLocalRemoteScanPlan';
@@ -99,8 +100,7 @@
     }
     const isGalaxy = /component=galaxy/.test(location.href);
     const isIngameRoot = /page=ingame/.test(location.search || '') && !isGalaxy;
-    // Only auto-open galaxy if continuous scan was active before reload.
-    const shouldAutoOpenGalaxy = Boolean(GM_getValue(KEY_CONTINUOUS_ACTIVE, false));
+    const shouldAutoOpenGalaxy = Boolean(GM_getValue(KEY_SCAN_RESUME_PENDING, false));
     if (isIngameRoot && shouldAutoOpenGalaxy) {
         initIngameAutoGalaxy();
     }
@@ -123,7 +123,7 @@
     let continuousTimer = null;
     let scanDelayMs = Number(GM_getValue(KEY_SCAN_SPEED, 1000));
     let continuousIntervalMs = Number(GM_getValue(KEY_CONTINUOUS_INTERVAL, 60000));
-    let resumeContinuous = Boolean(GM_getValue(KEY_CONTINUOUS_ACTIVE, false));
+    let resumeScanPending = Boolean(GM_getValue(KEY_SCAN_RESUME_PENDING, false));
     let resumeContinuousDone = false;
     let galaxyLoadTimeoutId = null;
     let scanPendingSince = 0;
@@ -131,7 +131,7 @@
     let reloadScheduled = false;
     let executeOnSlave = Boolean(GM_getValue(KEY_EXECUTE_ON_SLAVE, false));
     let remoteScanPlan = loadStoredRemoteScanPlan();
-    if (!resumeContinuous && remoteScanPlan) {
+    if (!resumeScanPending && remoteScanPlan) {
         clearRemoteScanPlan();
     }
     let lastRemoteCmdId = String(GM_getValue(KEY_LAST_REMOTE_CMD, '') || '');
@@ -800,6 +800,11 @@
     function clearRemoteScanPlan() {
         remoteScanPlan = null;
         GM_setValue(KEY_REMOTE_SCAN_PLAN, '');
+    }
+
+    function setScanResumePending(active) {
+        GM_setValue(KEY_SCAN_RESUME_PENDING, Boolean(active));
+        resumeScanPending = Boolean(active);
     }
 
     function setRemoteScanPlan(plan) {
@@ -2243,7 +2248,10 @@
         clearGalaxyLoadTimeout();
         if (scanActive && scanPending) {
             const keepRemotePlan = Boolean(isSyncSlave() && continuousActive);
-            stopScan('Timeout cargando galaxia. Recargando...', { keepRemotePlan: keepRemotePlan });
+            stopScan('Timeout cargando galaxia. Recargando...', {
+                keepRemotePlan: keepRemotePlan,
+                keepResumePending: true
+            });
             scheduleReload();
             return true;
         }
@@ -2289,6 +2297,7 @@
             setStatus('Modo esclava: controlado por master');
             return;
         }
+        setScanResumePending(false);
         if (opts.scanDelayMs !== undefined) {
             scanDelayMs = clampSpeed(Number(opts.scanDelayMs));
         }
@@ -2351,6 +2360,7 @@
         continuousActive = false;
         scanPending = false;
         scanPendingSince = 0;
+        setScanResumePending(Boolean(opts.keepResumePending));
         if (!opts.keepRemotePlan) {
             clearRemoteScanPlan();
         }
@@ -2477,8 +2487,9 @@
         addIcons();
         recordVisibleTargets();
         updateTargetPanel();
-        if (resumeContinuous && !resumeContinuousDone && !scanActive) {
+        if (resumeScanPending && !resumeContinuousDone && !scanActive) {
             resumeContinuousDone = true;
+            setScanResumePending(false);
             if (isSyncSlave()) {
                 const plan = remoteScanPlan || loadStoredRemoteScanPlan();
                 if (plan) {
@@ -2491,12 +2502,12 @@
                     });
                     setStatus('Reanudando orden remota tras recarga');
                 } else {
-                    resumeContinuous = false;
+                    resumeScanPending = false;
                     GM_setValue(KEY_CONTINUOUS_ACTIVE, false);
                     setStatus('Reanudar: falta plan remoto, esperando master');
                 }
             } else {
-                startScan(true);
+                startScan(Boolean(GM_getValue(KEY_CONTINUOUS_ACTIVE, false)));
             }
         }
         if (scanActive && scanPending) {
