@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.42
+// @version      0.7.43
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -45,6 +45,7 @@
     const SCAN_CONTINUOUS_ID = 'ptreLocalScanContinuous';
     const SCAN_STOP_ID = 'ptreLocalScanStop';
     const SYNC_CONFIG_ID = 'ptreLocalSyncConfig';
+    const RESET_LOCAL_ID = 'ptreLocalResetLocal';
     const SYNC_STATUS_ID = 'ptreLocalSyncStatus';
     const EXECUTE_SLAVE_ID = 'ptreLocalExecuteOnSlave';
     const EDIT_LOCK_STATUS_ID = 'ptreLocalEditLockStatus';
@@ -129,6 +130,8 @@
     let galaxyLoadingObserver = null;
     let galaxyLoadState = 'init';
     let galaxyReadyTimer = null;
+    let historyWindowRef = null;
+    let resetInProgress = false;
     let scanPendingSince = 0;
     let scanWatchdogId = null;
     let reloadScheduled = false;
@@ -226,6 +229,9 @@
     padding: 2px 6px;
     font: 12px/1.4 "Courier New", monospace;
 }
+#${PANEL_ID} .ptreLocalButtonDanger {
+    background: #5c1a1a;
+}
 #${PANEL_ID} .ptreLocalSection {
     margin-top: 8px;
     padding-top: 6px;
@@ -316,6 +322,7 @@
             <div class="ptreLocalRow">
                 <button id="${EDIT_LOCK_TAKE_ID}" class="ptreLocalButton">Tomar control</button>
                 <button id="${EDIT_LOCK_PASS_ID}" class="ptreLocalButton">Pasar control</button>
+                <button id="${RESET_LOCAL_ID}" class="ptreLocalButton ptreLocalButtonDanger">Reset local</button>
             </div>
             <div class="ptreLocalSection">
                 <div class="ptreLocalSectionTitle">Objetivos</div>
@@ -366,6 +373,11 @@
         if (syncConfigBtn && !syncConfigBtn.dataset.bound) {
             syncConfigBtn.dataset.bound = 'true';
             syncConfigBtn.addEventListener('click', configureSyncSettings);
+        }
+        const resetLocalBtn = document.getElementById(RESET_LOCAL_ID);
+        if (resetLocalBtn && !resetLocalBtn.dataset.bound) {
+            resetLocalBtn.dataset.bound = 'true';
+            resetLocalBtn.addEventListener('click', confirmAndResetLocalData);
         }
         const executeSlaveToggle = document.getElementById(EXECUTE_SLAVE_ID);
         if (executeSlaveToggle) {
@@ -521,6 +533,164 @@
         syncOnline = true;
         syncLastError = '';
         renderSyncStatus();
+    }
+
+    function resetStoredValuesToDefaults() {
+        GM_setValue(KEY_TARGETS, '{}');
+        GM_setValue(KEY_CLEANED, 'false');
+        GM_setValue(KEY_LAST_TARGET, '');
+        GM_setValue(KEY_SCAN_SPEED, 1000);
+        GM_setValue(KEY_CONTINUOUS_INTERVAL, 60000);
+        GM_setValue(KEY_CONTINUOUS_ACTIVE, false);
+        GM_setValue(KEY_SCAN_RESUME_PENDING, false);
+        GM_setValue(KEY_EXECUTE_ON_SLAVE, false);
+        GM_setValue(KEY_LAST_REMOTE_CMD, '');
+        GM_setValue(KEY_REMOTE_SCAN_PLAN, '');
+        GM_setValue(KEY_SYNC_MODE, DEFAULT_SYNC_MODE);
+        GM_setValue(KEY_SYNC_ENDPOINT, DEFAULT_SYNC_ENDPOINT);
+        GM_setValue(KEY_SYNC_TOKEN, DEFAULT_SYNC_TOKEN);
+        GM_setValue(KEY_SYNC_ACTOR_ID, '');
+        GM_setValue(KEY_SYNC_EDITOR_TOKEN, '');
+    }
+
+    function stopGalaxyWatcher() {
+        if (galaxyLoadingObserver) {
+            galaxyLoadingObserver.disconnect();
+            galaxyLoadingObserver = null;
+        }
+        if (galaxyReadyTimer) {
+            clearTimeout(galaxyReadyTimer);
+            galaxyReadyTimer = null;
+        }
+        galaxyLoadState = 'init';
+    }
+
+    function closeTrackedHistoryWindow() {
+        if (!historyWindowRef || historyWindowRef.closed) {
+            historyWindowRef = null;
+            return;
+        }
+        try {
+            historyWindowRef.close();
+        } catch (err) {
+            // ignore
+        }
+        historyWindowRef = null;
+    }
+
+    function closeDbConnection() {
+        return Promise.resolve(dbPromise).then((db) => {
+            if (db && typeof db.close === 'function') {
+                try {
+                    db.close();
+                } catch (err) {
+                    // ignore
+                }
+            }
+        }).catch(() => {}).then(() => {
+            dbPromise = null;
+        });
+    }
+
+    function resetRuntimeStateToDefaults() {
+        lastGalaxy = null;
+        lastSystem = null;
+        scanActive = false;
+        continuousActive = false;
+        scanQueue = [];
+        scanIndex = 0;
+        scanPending = false;
+        scanDelayMs = 1000;
+        continuousIntervalMs = 60000;
+        resumeScanPending = false;
+        resumeContinuousDone = false;
+        scanPendingSince = 0;
+        reloadScheduled = false;
+        executeOnSlave = false;
+        remoteScanPlan = null;
+        lastRemoteCmdId = '';
+        syncMode = DEFAULT_SYNC_MODE;
+        syncEndpoint = DEFAULT_SYNC_ENDPOINT;
+        syncToken = DEFAULT_SYNC_TOKEN;
+        syncActorId = '';
+        syncEditorToken = '';
+        syncPullInFlight = false;
+        syncPushInFlight = false;
+        syncPendingTargets = null;
+        syncPendingActivity = [];
+        syncActivityPushInFlight = false;
+        syncPendingCoords = [];
+        syncCoordsPushInFlight = false;
+        syncLastRemoteUpdatedAt = 0;
+        syncLastRemoteSerialized = '';
+        syncRemoteCoordsByPlayer = {};
+        syncRemoteCoordsUpdatedAt = 0;
+        syncRemoteCoordsSerialized = '';
+        syncOnline = false;
+        syncLastError = '';
+        syncRemoteEditLock = null;
+        syncEditLockClaimInFlight = false;
+        syncEditLockLastClaimAt = 0;
+    }
+
+    async function resetLocalData() {
+        if (resetInProgress) {
+            return;
+        }
+        resetInProgress = true;
+        const resetBtn = document.getElementById(RESET_LOCAL_ID);
+        if (resetBtn) {
+            resetBtn.disabled = true;
+        }
+        setStatus('Reset local en curso...');
+        closeTrackedHistoryWindow();
+        stopScan('', { keepRemotePlan: false, keepResumePending: false });
+        stopTargetsSync();
+        stopGalaxyWatcher();
+        clearGalaxyLoadTimeout();
+        stopScanWatchdog();
+        try {
+            await Promise.resolve(dbQueue).catch(() => {});
+            await clearDatabase();
+            resetStoredValuesToDefaults();
+            resetRuntimeStateToDefaults();
+            dbQueue = Promise.resolve();
+            updateSyncButtonLabel();
+            renderSyncStatus();
+            renderEditLockStatus();
+            updateTargetPanel();
+            setStatus('Reset local completado. Recargando...');
+            setTimeout(() => {
+                window.location.reload();
+            }, 300);
+        } catch (err) {
+            resetInProgress = false;
+            if (resetBtn) {
+                resetBtn.disabled = false;
+            }
+            setStatus('Error en reset local');
+            throw err;
+        }
+    }
+
+    function confirmAndResetLocalData() {
+        if (resetInProgress) {
+            return;
+        }
+        if (!window.confirm('Esto borrara TODOS los datos locales del script en ESTE navegador.\n\nNo borra el VPS ni el otro ordenador.\n\n¿Quieres continuar?')) {
+            return;
+        }
+        if (!window.confirm('Se borraran objetivos, historial local, configuracion local de sync, flags de escaneo y estado guardado.\n\n¿Seguro de verdad?')) {
+            return;
+        }
+        const confirmText = window.prompt('Ultima confirmacion.\n\nEscribe RESET para borrarlo todo y recargar la pagina.', '');
+        if (confirmText !== 'RESET') {
+            window.alert('Reset cancelado. No se ha borrado nada.');
+            return;
+        }
+        resetLocalData().catch((err) => {
+            window.alert('No se pudo completar el reset local: ' + (err && err.message ? err.message : 'error desconocido'));
+        });
     }
 
     function setSyncOffline(reason) {
@@ -1800,6 +1970,9 @@
         }
         syncPullInFlight = true;
         requestSyncJson('GET').then((payload) => {
+            if (resetInProgress || !isSyncEnabled()) {
+                return;
+            }
             applyRemoteTargetsFromPayload(payload, force, () => {
                 setStatus('Sync: objetivos actualizados');
             });
@@ -3011,17 +3184,21 @@
     }
 
     function clearDatabase() {
-        return new Promise((resolve, reject) => {
+        return closeDbConnection().then(() => new Promise((resolve, reject) => {
             const req = indexedDB.deleteDatabase(DB_NAME);
             req.onsuccess = () => {
                 dbPromise = null;
                 resolve();
             };
             req.onerror = () => reject(req.error);
-        });
+            req.onblocked = () => reject(new Error('Cierra el historial y otras pestañas de OGame con este script antes de reintentar'));
+        }));
     }
 
     function queueObservation(obs) {
+        if (resetInProgress) {
+            return;
+        }
         queueSlaveActivitySync(obs);
         queueSharedCoordsSync(obs);
         dbQueue = dbQueue.then(() => recordObservation(obs)).catch((err) => {
@@ -3098,6 +3275,7 @@
             setStatus('Popup bloqueado');
             return;
         }
+        historyWindowRef = win;
         const html = `
 <!doctype html>
 <html>
