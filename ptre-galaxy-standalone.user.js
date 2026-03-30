@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.41
+// @version      0.7.42
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -126,6 +126,9 @@
     let resumeScanPending = Boolean(GM_getValue(KEY_SCAN_RESUME_PENDING, false));
     let resumeContinuousDone = false;
     let galaxyLoadTimeoutId = null;
+    let galaxyLoadingObserver = null;
+    let galaxyLoadState = 'init';
+    let galaxyReadyTimer = null;
     let scanPendingSince = 0;
     let scanWatchdogId = null;
     let reloadScheduled = false;
@@ -4178,21 +4181,32 @@ th.row-title { z-index: 4; }
         win.document.close();
     }
 
-    function waitForGalaxyToBeLoaded() {
+    function isGalaxyLoadingVisible(galaxyLoading) {
+        return Boolean(galaxyLoading) && window.getComputedStyle(galaxyLoading).display !== 'none';
+    }
+
+    function queueGalaxyReady() {
+        if (galaxyReadyTimer) {
+            return;
+        }
+        galaxyReadyTimer = setTimeout(() => {
+            galaxyReadyTimer = null;
+            onGalaxyReady();
+        }, 0);
+    }
+
+    function syncGalaxyLoadingState() {
         const galaxyLoading = document.getElementById('galaxyLoading');
         if (!galaxyLoading) {
             return;
         }
-        if (window.getComputedStyle(galaxyLoading).display === 'none') {
-            onGalaxyReady();
-        } else {
-            const observer = new MutationObserver((mutations, obs) => {
-                if (window.getComputedStyle(galaxyLoading).display === 'none') {
-                    obs.disconnect();
-                    onGalaxyReady();
-                }
-            });
-            observer.observe(galaxyLoading, { childList: true, attributes: true });
+        if (isGalaxyLoadingVisible(galaxyLoading)) {
+            galaxyLoadState = 'loading';
+            return;
+        }
+        if (galaxyLoadState !== 'ready') {
+            galaxyLoadState = 'ready';
+            queueGalaxyReady();
         }
     }
 
@@ -4201,21 +4215,26 @@ th.row-title { z-index: 4; }
         if (!galaxyLoading) {
             return;
         }
-        const observer = new MutationObserver((mutations, obs) => {
-            if (window.getComputedStyle(galaxyLoading).display !== 'none') {
-                obs.disconnect();
-                waitForGalaxyToBeLoaded();
-                watchGalaxyChanges();
-            }
+        if (galaxyLoadingObserver) {
+            galaxyLoadingObserver.disconnect();
+            galaxyLoadingObserver = null;
+        }
+        galaxyLoadState = 'init';
+        if (galaxyReadyTimer) {
+            clearTimeout(galaxyReadyTimer);
+            galaxyReadyTimer = null;
+        }
+        galaxyLoadingObserver = new MutationObserver(() => {
+            syncGalaxyLoadingState();
         });
-        observer.observe(galaxyLoading, { childList: true, attributes: true });
+        galaxyLoadingObserver.observe(galaxyLoading, { childList: true, attributes: true });
+        syncGalaxyLoadingState();
     }
 
     ensurePanel();
     updateTargetPanel();
     startTargetsSync();
     if (isGalaxy) {
-        waitForGalaxyToBeLoaded();
         watchGalaxyChanges();
     } else {
         setStatus('Panel activo (fuera de Galaxia)');
