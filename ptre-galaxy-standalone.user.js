@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.44
+// @version      0.7.45
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -1520,7 +1520,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
             return normalized;
         }
         Object.keys(targets).forEach((key) => {
-            if (!key) {
+            if (!key || !looksLikeTargetKey(key)) {
                 return;
             }
             const value = targets[key];

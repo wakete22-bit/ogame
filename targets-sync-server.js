@@ -26,7 +26,7 @@ function normalizeTargets(input) {
         return normalized;
     }
     Object.keys(input).forEach((key) => {
-        if (!key) {
+        if (!key || !looksLikeTargetKey(key)) {
             return;
         }
         const value = input[key];
