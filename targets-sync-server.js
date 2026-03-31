@@ -670,6 +670,21 @@ if (startupPrunedActivity.removedAny || startupPrunedSharedCoords.removedAny) {
 }
 
 let persistTimer = null;
+let publicSharedCoordsCache = {};
+let publicSharedCoordsDirty = true;
+
+function invalidatePublicSharedCoordsCache() {
+    publicSharedCoordsDirty = true;
+}
+
+function getPublicSharedCoords() {
+    if (!publicSharedCoordsDirty) {
+        return publicSharedCoordsCache;
+    }
+    publicSharedCoordsCache = buildPublicSharedCoords();
+    publicSharedCoordsDirty = false;
+    return publicSharedCoordsCache;
+}
 
 function persistStateSync() {
     const tmpFile = DATA_FILE + '.tmp';
@@ -946,7 +961,7 @@ function buildPublicState(includeActivity) {
         control: state.control,
         controlUpdatedAt: state.controlUpdatedAt,
         editLock: getPublicEditLock(now),
-        sharedCoords: buildPublicSharedCoords(),
+        sharedCoords: getPublicSharedCoords(),
         sharedCoordsUpdatedAt: Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), safeNumber(state.activityUpdatedAt, 0))
     };
     if (includeActivity) {
@@ -1145,6 +1160,7 @@ const server = http.createServer(async (req, res) => {
         let stateChanged = false;
         let lockResult = null;
         let clearActivityResult = null;
+        let sharedCoordsChanged = false;
         if (Object.prototype.hasOwnProperty.call(update, 'targets')) {
             state.targets = update.targets;
             state.updatedAt = update.updatedAt;
@@ -1152,12 +1168,15 @@ const server = http.createServer(async (req, res) => {
             if (prunedActivity.removedAny) {
                 state.activity = prunedActivity.activity;
                 state.activityUpdatedAt = Math.max(safeNumber(state.activityUpdatedAt, 0), safeNumber(update.updatedAt, Date.now()));
+                sharedCoordsChanged = true;
             }
             const prunedSharedCoords = pruneSharedCoordsByTargets(state.sharedCoords, state.targets);
             if (prunedSharedCoords.removedAny) {
                 state.sharedCoords = prunedSharedCoords.sharedCoords;
                 state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), safeNumber(update.updatedAt, Date.now()));
+                sharedCoordsChanged = true;
             }
+            sharedCoordsChanged = true;
             stateChanged = true;
         }
         if (Object.prototype.hasOwnProperty.call(update, 'control')) {
@@ -1170,6 +1189,7 @@ const server = http.createServer(async (req, res) => {
             if (allowedBatch.length > 0) {
                 state.activity = mergeActivityBatch(state.activity, allowedBatch);
                 state.activityUpdatedAt = update.activityUpdatedAt;
+                sharedCoordsChanged = true;
                 stateChanged = true;
             }
         }
@@ -1187,7 +1207,9 @@ const server = http.createServer(async (req, res) => {
                 if (Object.prototype.hasOwnProperty.call(state.sharedCoords, update.activityClearPlayerKey)) {
                     delete state.sharedCoords[update.activityClearPlayerKey];
                     state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), safeNumber(update.activityUpdatedAt, Date.now()));
+                    sharedCoordsChanged = true;
                 }
+                sharedCoordsChanged = true;
                 stateChanged = true;
             }
         }
@@ -1196,6 +1218,7 @@ const server = http.createServer(async (req, res) => {
             if (allowedBatch.length > 0) {
                 state.sharedCoords = mergeSharedCoordsBatch(state.sharedCoords, allowedBatch);
                 state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), update.coordsUpdatedAt);
+                sharedCoordsChanged = true;
                 stateChanged = true;
             }
         }
@@ -1208,6 +1231,9 @@ const server = http.createServer(async (req, res) => {
             }
         }
         if (stateChanged) {
+            if (sharedCoordsChanged) {
+                invalidatePublicSharedCoordsCache();
+            }
             persistState();
         }
         const response = buildPublicState(false);
