@@ -1,13 +1,12 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.41.1
+// @version      0.7.40
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
 // @run-at       document-end
 // @grant        GM_addStyle
-// @grant        GM_deleteValue
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
@@ -31,7 +30,6 @@
     const KEY_SCAN_SPEED = 'ptreLocalScanSpeed';
     const KEY_CONTINUOUS_INTERVAL = 'ptreLocalContinuousInterval';
     const KEY_CONTINUOUS_ACTIVE = 'ptreLocalContinuousActive';
-    const KEY_SCAN_RESUME_PENDING = 'ptreLocalScanResumePending';
     const KEY_EXECUTE_ON_SLAVE = 'ptreLocalExecuteOnSlave';
     const KEY_LAST_REMOTE_CMD = 'ptreLocalLastRemoteCmd';
     const KEY_REMOTE_SCAN_PLAN = 'ptreLocalRemoteScanPlan';
@@ -51,7 +49,6 @@
     const EDIT_LOCK_STATUS_ID = 'ptreLocalEditLockStatus';
     const EDIT_LOCK_TAKE_ID = 'ptreLocalEditLockTake';
     const EDIT_LOCK_PASS_ID = 'ptreLocalEditLockPass';
-    const RESET_LOCAL_ID = 'ptreLocalResetLocal';
 
     const DB_NAME = 'ptreLocalActivityDB';
     const DB_VERSION = 3;
@@ -87,30 +84,13 @@
     const SYNC_COORDS_MAX_QUEUE = 1500;
     const SYNC_EDIT_LOCK_TTL_MS = 2 * 60 * 1000;
     const SYNC_EDIT_LOCK_HEARTBEAT_MS = 45 * 1000;
-    const SYNC_HTTP_TIMEOUT_MS = 15000;
+    const SYNC_HTTP_TIMEOUT_MS = 10000;
     const SYNC_TOKEN_HEADER = 'x-ptre-token';
     const HISTORY_BRIDGE_REQUEST = 'ptreLocalHistoryRemoteRequest';
     const HISTORY_BRIDGE_RESPONSE = 'ptreLocalHistoryRemoteResponse';
-    const HISTORY_BRIDGE_TIMEOUT_MS = 45000;
+    const HISTORY_BRIDGE_TIMEOUT_MS = 12000;
     const TARGETS_BRIDGE_REQUEST = 'ptreLocalTargetsBridgeRequest';
     const TARGETS_BRIDGE_RESPONSE = 'ptreLocalTargetsBridgeResponse';
-    const RESETTABLE_STORAGE_KEYS = [
-        KEY_TARGETS,
-        KEY_CLEANED,
-        KEY_LAST_TARGET,
-        KEY_SCAN_SPEED,
-        KEY_CONTINUOUS_INTERVAL,
-        KEY_CONTINUOUS_ACTIVE,
-        KEY_SCAN_RESUME_PENDING,
-        KEY_EXECUTE_ON_SLAVE,
-        KEY_LAST_REMOTE_CMD,
-        KEY_REMOTE_SCAN_PLAN,
-        KEY_SYNC_MODE,
-        KEY_SYNC_ENDPOINT,
-        KEY_SYNC_TOKEN,
-        KEY_SYNC_ACTOR_ID,
-        KEY_SYNC_EDITOR_TOKEN
-    ];
 
     const isLobby = location.hostname === 'lobby.ogame.gameforge.com' || /\/lobby/i.test(location.pathname);
     if (isLobby) {
@@ -119,7 +99,8 @@
     }
     const isGalaxy = /component=galaxy/.test(location.href);
     const isIngameRoot = /page=ingame/.test(location.search || '') && !isGalaxy;
-    const shouldAutoOpenGalaxy = Boolean(GM_getValue(KEY_SCAN_RESUME_PENDING, false));
+    // Only auto-open galaxy if continuous scan was active before reload.
+    const shouldAutoOpenGalaxy = Boolean(GM_getValue(KEY_CONTINUOUS_ACTIVE, false));
     if (isIngameRoot && shouldAutoOpenGalaxy) {
         initIngameAutoGalaxy();
     }
@@ -142,7 +123,7 @@
     let continuousTimer = null;
     let scanDelayMs = Number(GM_getValue(KEY_SCAN_SPEED, 1000));
     let continuousIntervalMs = Number(GM_getValue(KEY_CONTINUOUS_INTERVAL, 60000));
-    let resumeScanPending = Boolean(GM_getValue(KEY_SCAN_RESUME_PENDING, false));
+    let resumeContinuous = Boolean(GM_getValue(KEY_CONTINUOUS_ACTIVE, false));
     let resumeContinuousDone = false;
     let galaxyLoadTimeoutId = null;
     let scanPendingSince = 0;
@@ -150,7 +131,7 @@
     let reloadScheduled = false;
     let executeOnSlave = Boolean(GM_getValue(KEY_EXECUTE_ON_SLAVE, false));
     let remoteScanPlan = loadStoredRemoteScanPlan();
-    if (!resumeScanPending && remoteScanPlan) {
+    if (!resumeContinuous && remoteScanPlan) {
         clearRemoteScanPlan();
     }
     let lastRemoteCmdId = String(GM_getValue(KEY_LAST_REMOTE_CMD, '') || '');
@@ -332,7 +313,6 @@
             <div class="ptreLocalRow">
                 <button id="${EDIT_LOCK_TAKE_ID}" class="ptreLocalButton">Tomar control</button>
                 <button id="${EDIT_LOCK_PASS_ID}" class="ptreLocalButton">Pasar control</button>
-                <button id="${RESET_LOCAL_ID}" class="ptreLocalButton">Reset local</button>
             </div>
             <div class="ptreLocalSection">
                 <div class="ptreLocalSectionTitle">Objetivos</div>
@@ -408,13 +388,6 @@
             editLockPassBtn.dataset.bound = 'true';
             editLockPassBtn.addEventListener('click', () => {
                 passEditControl();
-            });
-        }
-        const resetLocalBtn = document.getElementById(RESET_LOCAL_ID);
-        if (resetLocalBtn && !resetLocalBtn.dataset.bound) {
-            resetLocalBtn.dataset.bound = 'true';
-            resetLocalBtn.addEventListener('click', () => {
-                confirmAndResetLocalState();
             });
         }
         updateSyncButtonLabel();
@@ -829,11 +802,6 @@
         GM_setValue(KEY_REMOTE_SCAN_PLAN, '');
     }
 
-    function setScanResumePending(active) {
-        GM_setValue(KEY_SCAN_RESUME_PENDING, Boolean(active));
-        resumeScanPending = Boolean(active);
-    }
-
     function setRemoteScanPlan(plan) {
         const normalized = normalizeRemoteScanPlan(plan);
         if (!normalized) {
@@ -1010,34 +978,6 @@
         return appendQueryParam(syncEndpoint, 'includeActivity', '1');
     }
 
-    function buildRemoteActivitySummarySyncUrl() {
-        let url = appendQueryParam(syncEndpoint, 'historyOnly', '1');
-        url = appendQueryParam(url, 'activitySummary', '1');
-        return url;
-    }
-
-    function buildRemoteActivityMetaSyncUrl(playerKey) {
-        let url = appendQueryParam(syncEndpoint, 'historyOnly', '1');
-        url = appendQueryParam(url, 'activityMeta', '1');
-        url = appendQueryParam(url, 'activityPlayerKey', String(playerKey || '').trim());
-        return url;
-    }
-
-    function buildRemoteActivityPlayerSyncUrl(playerKey, startTs, endTs, limit) {
-        let url = appendQueryParam(syncEndpoint, 'historyOnly', '1');
-        url = appendQueryParam(url, 'activityPlayerKey', String(playerKey || '').trim());
-        if (Number.isFinite(startTs) && startTs > 0) {
-            url = appendQueryParam(url, 'activityStartTs', String(Math.floor(startTs)));
-        }
-        if (Number.isFinite(endTs) && endTs > 0) {
-            url = appendQueryParam(url, 'activityEndTs', String(Math.floor(endTs)));
-        }
-        if (Number.isFinite(limit) && limit > 0) {
-            url = appendQueryParam(url, 'activityLimit', String(Math.floor(limit)));
-        }
-        return url;
-    }
-
     function requestSyncJson(method, payload, options) {
         const opts = options && typeof options === 'object' ? options : {};
         const requestUrl = String(opts.url || syncEndpoint || '').trim();
@@ -1107,35 +1047,6 @@
         });
     }
 
-    function waitMs(ms) {
-        return new Promise((resolve) => setTimeout(resolve, ms));
-    }
-
-    function isRetryableSyncError(err) {
-        const msg = String(err && err.message ? err.message : '').toLowerCase();
-        return msg.indexOf('timeout') !== -1 || msg.indexOf('network') !== -1;
-    }
-
-    function requestSyncJsonWithRetry(method, payload, options) {
-        const rawOpts = options && typeof options === 'object' ? options : {};
-        const retries = Math.max(0, Math.floor(Number(rawOpts.retries) || 0));
-        const retryDelayMs = Math.max(100, Math.floor(Number(rawOpts.retryDelayMs) || 400));
-        const reqOpts = Object.assign({}, rawOpts);
-        delete reqOpts.retries;
-        delete reqOpts.retryDelayMs;
-
-        const run = (attemptIdx) => {
-            return requestSyncJson(method, payload, reqOpts).catch((err) => {
-                if (attemptIdx > retries || !isRetryableSyncError(err)) {
-                    throw err;
-                }
-                return waitMs(retryDelayMs * attemptIdx).then(() => run(attemptIdx + 1));
-            });
-        };
-
-        return run(1);
-    }
-
     function ensureHistoryBridge() {
         if (historyBridgeBound) {
             return;
@@ -1179,41 +1090,8 @@
                     reply(null, 'sync no configurado');
                     return;
                 }
-                const historyAction = String(data.action || 'full').trim().toLowerCase();
-                let activityUrl = '';
-                if (historyAction === 'summary') {
-                    activityUrl = buildRemoteActivitySummarySyncUrl();
-                } else if (historyAction === 'playermeta') {
-                    const playerKey = String(data.playerKey || '').trim();
-                    if (!playerKey) {
-                        reply(null, 'playerKey requerido');
-                        return;
-                    }
-                    activityUrl = buildRemoteActivityMetaSyncUrl(playerKey);
-                } else if (historyAction === 'player') {
-                    const playerKey = String(data.playerKey || '').trim();
-                    if (!playerKey) {
-                        reply(null, 'playerKey requerido');
-                        return;
-                    }
-                    const startTsRaw = Number(data.startTs || 0);
-                    const endTsRaw = Number(data.endTs || 0);
-                    const limitRaw = Number(data.limit || 0);
-                    const startTs = Number.isFinite(startTsRaw) && startTsRaw > 0 ? Math.floor(startTsRaw) : 0;
-                    const endTs = Number.isFinite(endTsRaw) && endTsRaw > 0 ? Math.floor(endTsRaw) : 0;
-                    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : 0;
-                    activityUrl = buildRemoteActivityPlayerSyncUrl(playerKey, startTs, endTs, limit);
-                } else if (historyAction === 'full') {
-                    activityUrl = buildRemoteActivitySyncUrl();
-                } else {
-                    reply(null, 'accion historial no soportada');
-                    return;
-                }
-                requestSyncJsonWithRetry('GET', undefined, {
-                    url: activityUrl,
-                    retries: 2,
-                    retryDelayMs: 500
-                })
+                const activityUrl = buildRemoteActivitySyncUrl();
+                requestSyncJson('GET', undefined, { url: activityUrl })
                     .then((payload) => reply(payload, ''))
                     .catch((err) => reply(null, err && err.message ? err.message : 'sync error'));
                 return;
@@ -1924,102 +1802,6 @@
         startTargetsSync();
     }
 
-    function deleteStoredValue(key) {
-        if (!key) {
-            return;
-        }
-        try {
-            if (typeof GM_deleteValue === 'function') {
-                GM_deleteValue(key);
-                return;
-            }
-        } catch (err) {
-            // fallback below
-        }
-        GM_setValue(key, '');
-    }
-
-    function resetStoredValuesToFreshInstall() {
-        RESETTABLE_STORAGE_KEYS.forEach((key) => {
-            deleteStoredValue(key);
-        });
-    }
-
-    function resetRuntimeStateToFreshInstall() {
-        stopScan('', { keepResumePending: false, keepRemotePlan: false });
-        stopTargetsSync();
-        lastGalaxy = null;
-        lastSystem = null;
-        scanQueue = [];
-        scanIndex = 0;
-        scanPending = false;
-        scanPendingSince = 0;
-        scanDelayMs = 1000;
-        continuousIntervalMs = 60000;
-        resumeScanPending = false;
-        resumeContinuousDone = false;
-        reloadScheduled = false;
-        executeOnSlave = false;
-        remoteScanPlan = null;
-        lastRemoteCmdId = '';
-        syncMode = DEFAULT_SYNC_MODE;
-        syncEndpoint = DEFAULT_SYNC_ENDPOINT;
-        syncToken = DEFAULT_SYNC_TOKEN;
-        syncActorId = '';
-        syncEditorToken = '';
-        syncRemoteEditLock = null;
-        syncEditLockClaimInFlight = false;
-        syncEditLockLastClaimAt = 0;
-        setSyncOffline('');
-    }
-
-    function closeLocalDatabaseConnection() {
-        if (!dbPromise) {
-            return Promise.resolve();
-        }
-        return Promise.resolve(dbPromise).then((db) => {
-            if (db && typeof db.close === 'function') {
-                try {
-                    db.close();
-                } catch (err) {
-                    // ignore
-                }
-            }
-        }).catch(() => {
-            // ignore
-        }).then(() => {
-            dbPromise = null;
-        });
-    }
-
-    function confirmAndResetLocalState() {
-        if (!window.confirm('Esto borrara los datos locales de este navegador y dejara el script como recien instalado.')) {
-            return;
-        }
-        const confirmText = window.prompt('Escribe RESET para continuar', '');
-        if (confirmText !== 'RESET') {
-            setStatus('Reset local cancelado');
-            return;
-        }
-        setStatus('Reseteando datos locales...');
-        resetRuntimeStateToFreshInstall();
-        closeLocalDatabaseConnection()
-            .then(() => clearDatabase())
-            .then(() => {
-                resetStoredValuesToFreshInstall();
-                updateSyncButtonLabel();
-                updateTargetPanel();
-                setStatus('Reset local completado. Recargando...');
-                window.setTimeout(() => {
-                    window.location.reload();
-                }, 300);
-            })
-            .catch((err) => {
-                console.warn('[PTRE Local] reset local failed', err);
-                setStatus('Cierra historial u otras pestañas y reintenta');
-            });
-    }
-
     function updateSyncButtonLabel() {
         const btn = document.getElementById(SYNC_CONFIG_ID);
         if (!btn) {
@@ -2371,10 +2153,7 @@
         clearGalaxyLoadTimeout();
         if (scanActive && scanPending) {
             const keepRemotePlan = Boolean(isSyncSlave() && continuousActive);
-            stopScan('Timeout cargando galaxia. Recargando...', {
-                keepRemotePlan: keepRemotePlan,
-                keepResumePending: true
-            });
+            stopScan('Timeout cargando galaxia. Recargando...', { keepRemotePlan: keepRemotePlan });
             scheduleReload();
             return true;
         }
@@ -2420,7 +2199,6 @@
             setStatus('Modo esclava: controlado por master');
             return;
         }
-        setScanResumePending(false);
         if (opts.scanDelayMs !== undefined) {
             scanDelayMs = clampSpeed(Number(opts.scanDelayMs));
         }
@@ -2483,7 +2261,6 @@
         continuousActive = false;
         scanPending = false;
         scanPendingSince = 0;
-        setScanResumePending(Boolean(opts.keepResumePending));
         if (!opts.keepRemotePlan) {
             clearRemoteScanPlan();
         }
@@ -2610,9 +2387,8 @@
         addIcons();
         recordVisibleTargets();
         updateTargetPanel();
-        if (resumeScanPending && !resumeContinuousDone && !scanActive) {
+        if (resumeContinuous && !resumeContinuousDone && !scanActive) {
             resumeContinuousDone = true;
-            setScanResumePending(false);
             if (isSyncSlave()) {
                 const plan = remoteScanPlan || loadStoredRemoteScanPlan();
                 if (plan) {
@@ -2625,12 +2401,12 @@
                     });
                     setStatus('Reanudando orden remota tras recarga');
                 } else {
-                    resumeScanPending = false;
+                    resumeContinuous = false;
                     GM_setValue(KEY_CONTINUOUS_ACTIVE, false);
                     setStatus('Reanudar: falta plan remoto, esperando master');
                 }
             } else {
-                startScan(Boolean(GM_getValue(KEY_CONTINUOUS_ACTIVE, false)));
+                startScan(true);
             }
         }
         if (scanActive && scanPending) {
@@ -3131,15 +2907,14 @@
     }
 
     function clearDatabase() {
-        return closeLocalDatabaseConnection().then(() => new Promise((resolve, reject) => {
+        return new Promise((resolve, reject) => {
             const req = indexedDB.deleteDatabase(DB_NAME);
-            req.onblocked = () => reject(new Error('delete blocked'));
             req.onsuccess = () => {
                 dbPromise = null;
                 resolve();
             };
             req.onerror = () => reject(req.error);
-        }));
+        });
     }
 
     function queueObservation(obs) {
@@ -3296,14 +3071,6 @@ th.row-title { z-index: 4; }
     const REMOTE_REFRESH_MS = 15000;
     let remoteDataset = { players: [], buckets: [] };
     let remoteLoadedAt = 0;
-    let remotePlayerMetaByKey = new Map();
-    let remotePlayerBucketsByRange = new Map();
-
-    function clearRemoteHistoryCache() {
-        remoteLoadedAt = 0;
-        remotePlayerMetaByKey = new Map();
-        remotePlayerBucketsByRange = new Map();
-    }
 
     function openDb() {
         return openDbInternal(true);
@@ -3390,7 +3157,7 @@ th.row-title { z-index: 4; }
         root.appendChild(line);
     }
 
-    function requestRemotePayloadThroughBridge(action, payload) {
+    function requestRemotePayloadThroughBridge() {
         return new Promise((resolve, reject) => {
             if (!window.opener || window.opener.closed) {
                 reject(new Error('ventana master no disponible'));
@@ -3428,12 +3195,10 @@ th.row-title { z-index: 4; }
             };
             window.addEventListener('message', onMessage);
             try {
-                const body = payload && typeof payload === 'object' ? payload : {};
-                window.opener.postMessage(Object.assign({
+                window.opener.postMessage({
                     type: HISTORY_BRIDGE_REQUEST,
-                    reqId: reqId,
-                    action: String(action || '')
-                }, body), '*');
+                    reqId: reqId
+                }, '*');
             } catch (err) {
                 clearTimeout(timer);
                 window.removeEventListener('message', onMessage);
@@ -3613,60 +3378,9 @@ th.row-title { z-index: 4; }
         return data;
     }
 
-    function normalizeRemoteActivityMeta(payload, playerKey) {
-        const key = String(playerKey || '').trim();
-        const meta = {
-            playerKey: key,
-            dates: [],
-            coords: []
-        };
-        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-            return meta;
-        }
-        const raw = payload.activityMeta;
-        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-            return meta;
-        }
-        const rawDates = Array.isArray(raw.dates) ? raw.dates : [];
-        const rawCoords = Array.isArray(raw.coords) ? raw.coords : [];
-        meta.dates = rawDates
-            .map((item) => String(item || '').trim())
-            .filter((item) => /^\\d{4}-\\d{2}-\\d{2}$/.test(item))
-            .sort();
-        meta.coords = rawCoords
-            .map((item) => String(item || '').trim())
-            .filter((item) => /^\\d+:\\d+:\\d+$/.test(item))
-            .sort(compareCoords);
-        return meta;
-    }
-
-    function remoteRangeCacheKey(playerKey, startTs, endTs) {
-        return String(playerKey || '').trim() + '|' + String(startTs || 0) + '|' + String(endTs || 0);
-    }
-
     async function fetchRemoteDataset() {
-        const payload = await requestRemotePayloadThroughBridge('summary');
+        const payload = await requestRemotePayloadThroughBridge();
         return normalizeRemoteDataset(payload);
-    }
-
-    async function fetchRemotePlayerMeta(playerKey) {
-        const payload = await requestRemotePayloadThroughBridge('playerMeta', {
-            playerKey: playerKey
-        });
-        return normalizeRemoteActivityMeta(payload, playerKey);
-    }
-
-    async function fetchRemoteBucketsForPlayer(playerKey, startTs, endTs) {
-        const payload = await requestRemotePayloadThroughBridge('player', {
-            playerKey: playerKey,
-            startTs: startTs,
-            endTs: endTs,
-            limit: 2000
-        });
-        const dataset = normalizeRemoteDataset(payload);
-        return dataset.buckets
-            .filter((rec) => rec.playerKey === playerKey && rec.bucketTs >= startTs && rec.bucketTs <= endTs)
-            .sort((a, b) => (a.bucketTs || 0) - (b.bucketTs || 0));
     }
 
     async function ensureRemoteDataset(forceRefresh) {
@@ -3680,43 +3394,6 @@ th.row-title { z-index: 4; }
         remoteDataset = await fetchRemoteDataset();
         remoteLoadedAt = now;
         return remoteDataset;
-    }
-
-    async function ensureRemotePlayerMeta(playerKey, forceRefresh) {
-        if (!REMOTE_HISTORY_ONLY) {
-            return { playerKey: String(playerKey || '').trim(), dates: [], coords: [] };
-        }
-        const key = String(playerKey || '').trim();
-        if (!key) {
-            return { playerKey: '', dates: [], coords: [] };
-        }
-        const now = Date.now();
-        const cached = remotePlayerMetaByKey.get(key);
-        if (!forceRefresh && cached && (now - cached.loadedAt) < REMOTE_REFRESH_MS) {
-            return cached.meta;
-        }
-        const meta = await fetchRemotePlayerMeta(key);
-        remotePlayerMetaByKey.set(key, { loadedAt: now, meta: meta });
-        return meta;
-    }
-
-    async function ensureRemoteBucketsForPlayer(playerKey, startTs, endTs, forceRefresh) {
-        if (!REMOTE_HISTORY_ONLY) {
-            return [];
-        }
-        const key = String(playerKey || '').trim();
-        if (!key) {
-            return [];
-        }
-        const rangeKey = remoteRangeCacheKey(key, startTs, endTs);
-        const now = Date.now();
-        const cached = remotePlayerBucketsByRange.get(rangeKey);
-        if (!forceRefresh && cached && (now - cached.loadedAt) < REMOTE_REFRESH_MS) {
-            return cached.buckets.slice();
-        }
-        const buckets = await fetchRemoteBucketsForPlayer(key, startTs, endTs);
-        remotePlayerBucketsByRange.set(rangeKey, { loadedAt: now, buckets: buckets.slice() });
-        return buckets.slice();
     }
 
     async function getSource(options) {
@@ -3742,8 +3419,14 @@ th.row-title { z-index: 4; }
 
     async function loadDatesForPlayer(source, playerKey) {
         if (REMOTE_HISTORY_ONLY) {
-            const meta = await ensureRemotePlayerMeta(playerKey, false);
-            return Array.isArray(meta.dates) ? meta.dates.slice() : [];
+            const dates = new Set();
+            const list = Array.isArray(source.buckets) ? source.buckets : [];
+            list.forEach((rec) => {
+                if (rec.playerKey === playerKey) {
+                    dates.add(dateKey(rec.bucketTs));
+                }
+            });
+            return Array.from(dates).sort();
         }
         return new Promise((resolve, reject) => {
             const tx = source.transaction([STORE_BUCKETS], 'readonly');
@@ -3767,8 +3450,19 @@ th.row-title { z-index: 4; }
 
     async function loadCoordsForPlayer(source, playerKey) {
         if (REMOTE_HISTORY_ONLY) {
-            const meta = await ensureRemotePlayerMeta(playerKey, false);
-            return Array.isArray(meta.coords) ? meta.coords.slice() : [];
+            const coords = new Set();
+            const list = Array.isArray(source.buckets) ? source.buckets : [];
+            list.forEach((rec) => {
+                if (rec.playerKey !== playerKey) {
+                    return;
+                }
+                const coord = String(rec.coords || '').trim();
+                if (!coord || coord === 'unknown') {
+                    return;
+                }
+                coords.add(coord);
+            });
+            return Array.from(coords).sort(compareCoords);
         }
         return new Promise((resolve, reject) => {
             const tx = source.transaction([STORE_BUCKETS], 'readonly');
@@ -3795,7 +3489,8 @@ th.row-title { z-index: 4; }
 
     async function loadBucketsForPlayer(source, playerKey, startTs, endTs) {
         if (REMOTE_HISTORY_ONLY) {
-            return ensureRemoteBucketsForPlayer(playerKey, startTs, endTs, false);
+            const list = Array.isArray(source.buckets) ? source.buckets : [];
+            return list.filter((rec) => rec.playerKey === playerKey && rec.bucketTs >= startTs && rec.bucketTs <= endTs);
         }
         return new Promise((resolve, reject) => {
             const tx = source.transaction([STORE_BUCKETS], 'readonly');
@@ -4091,7 +3786,7 @@ th.row-title { z-index: 4; }
                 }
                 let sourceNow;
                 try {
-                    sourceNow = await getSource({ forceRemote: false });
+                    sourceNow = await getSource({ forceRemote: REMOTE_HISTORY_ONLY });
                 } catch (err) {
                     setRootMessage(root, 'Error cargando fechas: ' + (err && err.message ? err.message : 'desconocido'));
                     return;
@@ -4169,7 +3864,7 @@ th.row-title { z-index: 4; }
 
                 let sourceNow;
                 try {
-                    sourceNow = await getSource({ forceRemote: false });
+                    sourceNow = await getSource({ forceRemote: REMOTE_HISTORY_ONLY });
                 } catch (err) {
                     setRootMessage(root, 'Error cargando datos: ' + (err && err.message ? err.message : 'desconocido'));
                     return;
@@ -4234,7 +3929,6 @@ th.row-title { z-index: 4; }
             refreshNow.dataset.bound = 'true';
             refreshNow.addEventListener('click', async () => {
                 root.innerHTML = '';
-                clearRemoteHistoryCache();
                 await refreshTargetsState();
                 if (playerSelect.value && dateSelect.value) {
                     dateSelect.dispatchEvent(new Event('change'));
@@ -4267,7 +3961,7 @@ th.row-title { z-index: 4; }
                 try {
                     if (REMOTE_HISTORY_ONLY) {
                         await clearHistoryForPlayerThroughBridge(playerKey);
-                        clearRemoteHistoryCache();
+                        remoteLoadedAt = 0;
                         await ensureRemoteDataset(true);
                     } else {
                         const dbNow = await getSource();
