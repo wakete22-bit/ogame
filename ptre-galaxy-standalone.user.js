@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.47
+// @version      0.7.48
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -41,6 +41,7 @@
     const KEY_SYNC_EDITOR_TOKEN = 'ptreLocalSyncEditorToken';
     const KEY_DEBUG_ENABLED = 'ptreLocalDebugEnabled';
     const KEY_DEBUG_LOG = 'ptreLocalDebugLog';
+    const KEY_DEBUG_SYNC_SWITCHES = 'ptreLocalDebugSyncSwitches';
     const SCAN_SPEED_ID = 'ptreLocalScanSpeed';
     const CONTINUOUS_INTERVAL_ID = 'ptreLocalContinuousInterval';
     const SCAN_START_ID = 'ptreLocalScanStart';
@@ -52,6 +53,9 @@
     const DEBUG_DUMP_ID = 'ptreLocalDebugDump';
     const DEBUG_CLEAR_ID = 'ptreLocalDebugClear';
     const DEBUG_STATUS_ID = 'ptreLocalDebugStatus';
+    const DEBUG_SYNC_STATUS_ID = 'ptreLocalDebugSyncStatus';
+    const DEBUG_SYNC_PRESET_ALL_ID = 'ptreLocalDebugSyncPresetAll';
+    const DEBUG_SYNC_PRESET_GET_ID = 'ptreLocalDebugSyncPresetGet';
     const SYNC_STATUS_ID = 'ptreLocalSyncStatus';
     const EXECUTE_SLAVE_ID = 'ptreLocalExecuteOnSlave';
     const EDIT_LOCK_STATUS_ID = 'ptreLocalEditLockStatus';
@@ -105,6 +109,17 @@
     const DEBUG_LAG_WARN_MS = 2000;
     const DEBUG_SYNC_STAGE_INFO_MS = 40;
     const DEBUG_SYNC_STAGE_WARN_MS = 120;
+    const DEBUG_SYNC_SWITCH_DEFS = [
+        { key: 'pullGet', label: 'GET poll' },
+        { key: 'lockPut', label: 'Lock PUT' },
+        { key: 'applyTargets', label: 'Aplicar objetivos' },
+        { key: 'applyCoords', label: 'Aplicar coords' },
+        { key: 'applyLock', label: 'Aplicar lock/UI' },
+        { key: 'applyControl', label: 'Orden remota' },
+        { key: 'pushTargets', label: 'Push objetivos' },
+        { key: 'pushActivity', label: 'Push actividad' },
+        { key: 'pushCoords', label: 'Push coords' }
+    ];
 
     const isLobby = location.hostname === 'lobby.ogame.gameforge.com' || /\/lobby/i.test(location.pathname);
     if (isLobby) {
@@ -191,6 +206,7 @@
     let historyBridgeBound = false;
     let debugEnabled = Boolean(GM_getValue(KEY_DEBUG_ENABLED, false));
     let debugEntries = loadStoredDebugEntries();
+    let debugSyncSwitches = loadDebugSyncSwitches();
     let debugPersistTimer = null;
     let debugLagTimer = null;
     let debugLagLastTick = 0;
@@ -351,6 +367,23 @@
                 <button id="${DEBUG_CLEAR_ID}" class="ptreLocalButton">Limpiar debug</button>
             </div>
             <div id="${DEBUG_STATUS_ID}" class="ptreLocalSyncStatus">Debug: off</div>
+            <div class="ptreLocalSection">
+                <div class="ptreLocalSectionTitle">Aislar sync</div>
+                <div class="ptreLocalRow">
+                    <button id="${DEBUG_SYNC_PRESET_ALL_ID}" class="ptreLocalButton">Todo on</button>
+                    <button id="${DEBUG_SYNC_PRESET_GET_ID}" class="ptreLocalButton">Solo GET</button>
+                </div>
+                <div id="${DEBUG_SYNC_STATUS_ID}" class="ptreLocalSyncStatus">Aislar sync: todo on</div>
+                <div class="ptreLocalToggle"><label><input data-ptre-debug-sync="pullGet" type="checkbox"> GET poll</label></div>
+                <div class="ptreLocalToggle"><label><input data-ptre-debug-sync="lockPut" type="checkbox"> Lock PUT</label></div>
+                <div class="ptreLocalToggle"><label><input data-ptre-debug-sync="applyTargets" type="checkbox"> Aplicar objetivos</label></div>
+                <div class="ptreLocalToggle"><label><input data-ptre-debug-sync="applyCoords" type="checkbox"> Aplicar coords</label></div>
+                <div class="ptreLocalToggle"><label><input data-ptre-debug-sync="applyLock" type="checkbox"> Aplicar lock/UI</label></div>
+                <div class="ptreLocalToggle"><label><input data-ptre-debug-sync="applyControl" type="checkbox"> Orden remota</label></div>
+                <div class="ptreLocalToggle"><label><input data-ptre-debug-sync="pushTargets" type="checkbox"> Push objetivos</label></div>
+                <div class="ptreLocalToggle"><label><input data-ptre-debug-sync="pushActivity" type="checkbox"> Push actividad</label></div>
+                <div class="ptreLocalToggle"><label><input data-ptre-debug-sync="pushCoords" type="checkbox"> Push coords</label></div>
+            </div>
             <div id="${EDIT_LOCK_STATUS_ID}" class="ptreLocalEditStatus">Edición: local</div>
             <div class="ptreLocalRow">
                 <button id="${EDIT_LOCK_TAKE_ID}" class="ptreLocalButton">Tomar control</button>
@@ -422,6 +455,30 @@
             debugClearBtn.dataset.bound = 'true';
             debugClearBtn.addEventListener('click', clearDebugEntries);
         }
+        const debugSyncPresetAllBtn = document.getElementById(DEBUG_SYNC_PRESET_ALL_ID);
+        if (debugSyncPresetAllBtn && !debugSyncPresetAllBtn.dataset.bound) {
+            debugSyncPresetAllBtn.dataset.bound = 'true';
+            debugSyncPresetAllBtn.addEventListener('click', () => {
+                applyDebugSyncSwitchPreset('all');
+            });
+        }
+        const debugSyncPresetGetBtn = document.getElementById(DEBUG_SYNC_PRESET_GET_ID);
+        if (debugSyncPresetGetBtn && !debugSyncPresetGetBtn.dataset.bound) {
+            debugSyncPresetGetBtn.dataset.bound = 'true';
+            debugSyncPresetGetBtn.addEventListener('click', () => {
+                applyDebugSyncSwitchPreset('getOnly');
+            });
+        }
+        const debugSyncInputs = panel.querySelectorAll('input[data-ptre-debug-sync]');
+        debugSyncInputs.forEach((input) => {
+            if (input.dataset.bound) {
+                return;
+            }
+            input.dataset.bound = 'true';
+            input.addEventListener('change', () => {
+                setDebugSyncSwitch(input.dataset.ptreDebugSync || '', Boolean(input.checked));
+            });
+        });
         const resetLocalBtn = document.getElementById(RESET_LOCAL_ID);
         if (resetLocalBtn && !resetLocalBtn.dataset.bound) {
             resetLocalBtn.dataset.bound = 'true';
@@ -456,6 +513,7 @@
         updateSyncButtonLabel();
         renderSyncStatus();
         renderDebugStatus();
+        renderDebugSyncSwitches();
         renderEditLockStatus();
         const targetSelect = document.getElementById(TARGET_SELECT_ID);
         if (targetSelect && !targetSelect.dataset.bound) {
@@ -569,6 +627,59 @@
         }
     }
 
+    function buildDefaultDebugSyncSwitches() {
+        const defaults = {};
+        DEBUG_SYNC_SWITCH_DEFS.forEach((def) => {
+            defaults[def.key] = true;
+        });
+        return defaults;
+    }
+
+    function buildGetOnlyDebugSyncSwitches() {
+        const next = buildDefaultDebugSyncSwitches();
+        Object.keys(next).forEach((key) => {
+            next[key] = false;
+        });
+        next.pullGet = true;
+        return next;
+    }
+
+    function normalizeDebugSyncSwitches(input) {
+        const defaults = buildDefaultDebugSyncSwitches();
+        if (!input || typeof input !== 'object' || Array.isArray(input)) {
+            return defaults;
+        }
+        const normalized = {};
+        DEBUG_SYNC_SWITCH_DEFS.forEach((def) => {
+            normalized[def.key] = Object.prototype.hasOwnProperty.call(input, def.key)
+                ? Boolean(input[def.key])
+                : defaults[def.key];
+        });
+        return normalized;
+    }
+
+    function loadDebugSyncSwitches() {
+        const raw = String(GM_getValue(KEY_DEBUG_SYNC_SWITCHES, '') || '').trim();
+        if (!raw) {
+            return buildDefaultDebugSyncSwitches();
+        }
+        try {
+            return normalizeDebugSyncSwitches(JSON.parse(raw));
+        } catch (err) {
+            return buildDefaultDebugSyncSwitches();
+        }
+    }
+
+    function getDisabledDebugSyncLabels() {
+        return DEBUG_SYNC_SWITCH_DEFS
+            .filter((def) => !debugSyncSwitches[def.key])
+            .map((def) => def.label);
+    }
+
+    function isDebugSyncSwitchEnabled(key) {
+        return !debugSyncSwitches || debugSyncSwitches[key] !== false;
+    }
+
     function serializeDebugExtra(extra) {
         if (extra === undefined) {
             return '';
@@ -625,6 +736,7 @@
             galaxyLoadState: galaxyLoadState,
             remotePlanLength: remoteScanPlan && Array.isArray(remoteScanPlan.queue) ? remoteScanPlan.queue.length : 0,
             executeOnSlave: executeOnSlave,
+            debugSyncDisabled: getDisabledDebugSyncLabels(),
             resetInProgress: resetInProgress,
             status: document.getElementById(STATUS_ID) ? document.getElementById(STATUS_ID).textContent : ''
         };
@@ -746,6 +858,67 @@
         statusEl.classList.remove('ok', 'error');
         if (kind) {
             statusEl.classList.add(kind);
+        }
+    }
+
+    function renderDebugSyncSwitches() {
+        const statusEl = document.getElementById(DEBUG_SYNC_STATUS_ID);
+        const inputs = document.querySelectorAll('input[data-ptre-debug-sync]');
+        inputs.forEach((input) => {
+            const key = String(input.dataset.ptreDebugSync || '');
+            input.checked = isDebugSyncSwitchEnabled(key);
+        });
+        if (!statusEl) {
+            return;
+        }
+        const disabled = getDisabledDebugSyncLabels();
+        statusEl.classList.remove('ok', 'error');
+        if (disabled.length === 0) {
+            statusEl.textContent = 'Aislar sync: todo on';
+            statusEl.classList.add('ok');
+            return;
+        }
+        statusEl.textContent = 'Aislar sync: off -> ' + disabled.join(', ');
+        statusEl.classList.add('error');
+    }
+
+    function persistDebugSyncSwitches() {
+        GM_setValue(KEY_DEBUG_SYNC_SWITCHES, JSON.stringify(debugSyncSwitches));
+        renderDebugSyncSwitches();
+    }
+
+    function applyDebugSyncSwitchPreset(mode) {
+        if (mode === 'getOnly') {
+            debugSyncSwitches = buildGetOnlyDebugSyncSwitches();
+        } else {
+            debugSyncSwitches = buildDefaultDebugSyncSwitches();
+        }
+        if (!isDebugSyncSwitchEnabled('lockPut')) {
+            stopEditLockHeartbeat();
+        }
+        persistDebugSyncSwitches();
+        if (debugEnabled) {
+            recordDebugEntry('debug.sync', mode === 'getOnly' ? 'Preset Solo GET' : 'Preset Todo on', {
+                disabled: getDisabledDebugSyncLabels()
+            });
+        }
+    }
+
+    function setDebugSyncSwitch(key, enabled) {
+        const targetKey = String(key || '').trim();
+        if (!targetKey || !Object.prototype.hasOwnProperty.call(debugSyncSwitches, targetKey)) {
+            renderDebugSyncSwitches();
+            return;
+        }
+        debugSyncSwitches[targetKey] = Boolean(enabled);
+        if (targetKey === 'lockPut' && !enabled) {
+            stopEditLockHeartbeat();
+        }
+        persistDebugSyncSwitches();
+        if (debugEnabled) {
+            recordDebugEntry('debug.sync', 'Switch ' + targetKey + '=' + (enabled ? 'on' : 'off'), {
+                disabled: getDisabledDebugSyncLabels()
+            });
         }
     }
 
@@ -1007,6 +1180,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         GM_setValue(KEY_SYNC_EDITOR_TOKEN, '');
         GM_setValue(KEY_DEBUG_ENABLED, false);
         GM_setValue(KEY_DEBUG_LOG, '[]');
+        GM_setValue(KEY_DEBUG_SYNC_SWITCHES, JSON.stringify(buildDefaultDebugSyncSwitches()));
     }
 
     function stopGalaxyWatcher() {
@@ -1089,6 +1263,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         syncEditLockLastClaimAt = 0;
         debugEnabled = false;
         debugEntries = [];
+        debugSyncSwitches = buildDefaultDebugSyncSwitches();
         debugLastHint = '';
         debugRateState = new Map();
         debugLastGalaxyLoadingVisible = null;
@@ -1121,6 +1296,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
             updateSyncButtonLabel();
             renderSyncStatus();
             renderDebugStatus();
+            renderDebugSyncSwitches();
             renderEditLockStatus();
             updateTargetPanel();
             setStatus('Reset local completado. Recargando...');
@@ -1279,6 +1455,9 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     function updateRemoteEditLockFromPayload(payload) {
         const startedAt = nowPerfMs();
         syncRemoteEditLock = normalizeRemoteEditLock(payload);
+        if (!isDebugSyncSwitchEnabled('applyLock')) {
+            return false;
+        }
         renderEditLockStatus();
         refreshTargetIcons();
         let autoClaimed = false;
@@ -1291,6 +1470,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
             ownerId: syncRemoteEditLock && syncRemoteEditLock.ownerId ? syncRemoteEditLock.ownerId : '',
             autoClaimed: autoClaimed
         });
+        return true;
     }
 
     function canPushTargetsSync() {
@@ -2023,6 +2203,9 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function applyRemoteSharedCoordsFromPayload(payload, force, onApplied) {
+        if (!isDebugSyncSwitchEnabled('applyCoords')) {
+            return false;
+        }
         const startedAt = nowPerfMs();
         const remote = parseRemoteSharedCoordsPayload(payload);
         if (!remote) {
@@ -2062,6 +2245,9 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function applyRemoteTargetsFromPayload(payload, force, onApplied) {
+        if (!isDebugSyncSwitchEnabled('applyTargets')) {
+            return false;
+        }
         const startedAt = nowPerfMs();
         const remote = parseRemoteTargetsPayload(payload);
         if (!remote) {
@@ -2115,6 +2301,9 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         const opts = options && typeof options === 'object' ? options : {};
         if (!isSyncEnabled() || !isSyncConfigured()) {
             return Promise.resolve({ ok: false, reason: 'sync_not_configured' });
+        }
+        if (!isDebugSyncSwitchEnabled('lockPut')) {
+            return Promise.resolve({ ok: false, reason: 'debug_gate' });
         }
         const startedAt = nowPerfMs();
         return requestSyncJson('PUT', {
@@ -2227,7 +2416,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function queueHostTargetsSync(targets) {
-        if (!canPushTargetsSync()) {
+        if (!canPushTargetsSync() || !isDebugSyncSwitchEnabled('pushTargets')) {
             return;
         }
         syncPendingTargets = normalizeTargets(targets);
@@ -2241,7 +2430,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function flushHostTargetsSync() {
-        if (!canPushTargetsSync() || !syncPendingTargets) {
+        if (!canPushTargetsSync() || !syncPendingTargets || !isDebugSyncSwitchEnabled('pushTargets')) {
             return;
         }
         if (syncPushInFlight) {
@@ -2276,7 +2465,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function queueSlaveActivitySync(obs) {
-        if (!isSyncSlave() || !isSyncConfigured()) {
+        if (!isSyncSlave() || !isSyncConfigured() || !isDebugSyncSwitchEnabled('pushActivity')) {
             return;
         }
         const normalized = normalizeActivityObservation(obs);
@@ -2297,7 +2486,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function flushSlaveActivitySync() {
-        if (!isSyncSlave() || !isSyncConfigured() || syncPendingActivity.length === 0) {
+        if (!isSyncSlave() || !isSyncConfigured() || syncPendingActivity.length === 0 || !isDebugSyncSwitchEnabled('pushActivity')) {
             return;
         }
         if (syncActivityPushInFlight) {
@@ -2337,7 +2526,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function queueSharedCoordsSync(obs) {
-        if (!isSyncEnabled() || !isSyncConfigured()) {
+        if (!isSyncEnabled() || !isSyncConfigured() || !isDebugSyncSwitchEnabled('pushCoords')) {
             return;
         }
         const normalized = normalizeSharedCoordObservation(obs);
@@ -2358,7 +2547,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function flushSharedCoordsSync() {
-        if (!isSyncEnabled() || !isSyncConfigured() || syncPendingCoords.length === 0) {
+        if (!isSyncEnabled() || !isSyncConfigured() || syncPendingCoords.length === 0 || !isDebugSyncSwitchEnabled('pushCoords')) {
             return;
         }
         if (syncCoordsPushInFlight) {
@@ -2478,6 +2667,9 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function applyRemoteControlCommand(payload) {
+        if (!isDebugSyncSwitchEnabled('applyControl')) {
+            return;
+        }
         if (!isSyncSlave()) {
             return;
         }
@@ -2533,7 +2725,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function pullTargetsFromRemote(force) {
-        if (!isSyncEnabled() || !isSyncConfigured() || syncPullInFlight) {
+        if (!isSyncEnabled() || !isSyncConfigured() || syncPullInFlight || !isDebugSyncSwitchEnabled('pullGet')) {
             return;
         }
         markDebugRate('pullTargetsFromRemote', 6, 5000, {
