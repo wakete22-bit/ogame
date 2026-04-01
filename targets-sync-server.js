@@ -10,15 +10,10 @@ const PORT = Number(process.env.PORT || 8787);
 const SYNC_TOKEN = process.env.SYNC_TOKEN || '';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'targets-store.json');
 const MAX_BODY_BYTES = 1024 * 1024;
-const PERSIST_DEBOUNCE_MS = Math.max(100, Number(process.env.PERSIST_DEBOUNCE_MS || 750));
-const SLOW_REQUEST_MS = Math.max(250, Number(process.env.SLOW_REQUEST_MS || 1200));
-const SLOW_PERSIST_MS = Math.max(250, Number(process.env.SLOW_PERSIST_MS || 800));
-const LOG_ALL_REQUESTS = /^(1|true|yes)$/i.test(String(process.env.LOG_ALL_REQUESTS || '').trim());
-const KEEP_ALIVE_TIMEOUT_MS = Math.max(10000, Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 65000));
-const HEADERS_TIMEOUT_MS = Math.max(KEEP_ALIVE_TIMEOUT_MS + 5000, Number(process.env.HEADERS_TIMEOUT_MS || (KEEP_ALIVE_TIMEOUT_MS + 5000)));
 const EDIT_LOCK_DEFAULT_TTL_MS = 2 * 60 * 1000;
 const EDIT_LOCK_MIN_TTL_MS = 30 * 1000;
 const EDIT_LOCK_MAX_TTL_MS = 15 * 60 * 1000;
+const PERSISTENT_EDIT_LOCK_EXPIRES_AT = 253402300799000; // 9999-12-31T23:59:59Z
 
 function safeNumber(value, fallback) {
     const num = Number(value);
@@ -31,7 +26,7 @@ function normalizeTargets(input) {
         return normalized;
     }
     Object.keys(input).forEach((key) => {
-        if (!key || !looksLikeTargetKey(key)) {
+        if (!key) {
             return;
         }
         const value = input[key];
@@ -671,133 +666,14 @@ if (startupPrunedActivity.removedAny || startupPrunedSharedCoords.removedAny) {
         state.sharedCoords = startupPrunedSharedCoords.sharedCoords;
         state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), startupNow);
     }
-    persistStateSync();
-}
-
-let persistTimer = null;
-let persistDirty = false;
-let persistInFlight = false;
-let publicSharedCoordsCache = {};
-let publicSharedCoordsDirty = true;
-
-function invalidatePublicSharedCoordsCache() {
-    publicSharedCoordsDirty = true;
-}
-
-function getPublicSharedCoords() {
-    if (!publicSharedCoordsDirty) {
-        return publicSharedCoordsCache;
-    }
-    publicSharedCoordsCache = buildPublicSharedCoords();
-    publicSharedCoordsDirty = false;
-    return publicSharedCoordsCache;
-}
-
-function logPersistResult(durationMs, bytes, err) {
-    if (err) {
-        console.warn('[targets-sync-server] persist failed:', err && err.message ? err.message : err);
-        return;
-    }
-    if (!LOG_ALL_REQUESTS && durationMs < SLOW_PERSIST_MS) {
-        return;
-    }
-    console.log('[targets-sync-server] persist ok duration=' + durationMs + 'ms bytes=' + bytes);
-}
-
-function persistStateSync() {
-    const tmpFile = DATA_FILE + '.tmp';
-    const startedAt = Date.now();
-    const body = JSON.stringify(state);
-    fs.writeFileSync(tmpFile, body, 'utf8');
-    fs.renameSync(tmpFile, DATA_FILE);
-    logPersistResult(Date.now() - startedAt, Buffer.byteLength(body, 'utf8'), null);
-}
-
-function flushPersistAsync() {
-    if (!persistDirty || persistInFlight) {
-        return;
-    }
-    const tmpFile = DATA_FILE + '.tmp';
-    let body = '';
-    const startedAt = Date.now();
-    persistDirty = false;
-    persistInFlight = true;
-
-    try {
-        body = JSON.stringify(state);
-    } catch (err) {
-        persistInFlight = false;
-        persistDirty = true;
-        console.warn('[targets-sync-server] persist failed:', err && err.message ? err.message : err);
-        persistState();
-        return;
-    }
-
-    const byteLength = Buffer.byteLength(body, 'utf8');
-    fs.writeFile(tmpFile, body, 'utf8', (writeErr) => {
-        if (writeErr) {
-            persistInFlight = false;
-            persistDirty = true;
-            logPersistResult(Date.now() - startedAt, byteLength, writeErr);
-            persistState();
-            return;
-        }
-        fs.rename(tmpFile, DATA_FILE, (renameErr) => {
-            persistInFlight = false;
-            if (renameErr) {
-                persistDirty = true;
-                logPersistResult(Date.now() - startedAt, byteLength, renameErr);
-                persistState();
-                return;
-            }
-            logPersistResult(Date.now() - startedAt, byteLength, null);
-            if (persistDirty) {
-                persistState();
-            }
-        });
-    });
+    persistState();
 }
 
 function persistState() {
-    persistDirty = true;
-    if (persistTimer) {
-        return;
-    }
-    persistTimer = setTimeout(() => {
-        persistTimer = null;
-        flushPersistAsync();
-    }, PERSIST_DEBOUNCE_MS);
+    const tmpFile = DATA_FILE + '.tmp';
+    fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2), 'utf8');
+    fs.renameSync(tmpFile, DATA_FILE);
 }
-
-function flushPendingPersist() {
-    if (persistTimer) {
-        clearTimeout(persistTimer);
-        persistTimer = null;
-    }
-    if (!persistDirty && !persistInFlight) {
-        return;
-    }
-    persistDirty = false;
-    persistStateSync();
-}
-
-process.on('SIGINT', () => {
-    try {
-        flushPendingPersist();
-    } catch (err) {
-        // ignore flush errors during shutdown
-    }
-    process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-    try {
-        flushPendingPersist();
-    } catch (err) {
-        // ignore flush errors during shutdown
-    }
-    process.exit(0);
-});
 
 function cleanupExpiredLock(now) {
     if (!state.editLock) {
@@ -844,7 +720,7 @@ function applyEditLockCommand(command) {
             ownerId: command.ownerId,
             ownerLabel: command.ownerLabel || command.ownerId,
             token: command.token,
-            expiresAt: now + clampLockTtl(command.ttlMs),
+            expiresAt: PERSISTENT_EDIT_LOCK_EXPIRES_AT,
             updatedAt: now
         };
         return {
@@ -872,7 +748,7 @@ function applyEditLockCommand(command) {
             };
         }
         current.ownerLabel = command.ownerLabel || current.ownerLabel || current.ownerId;
-        current.expiresAt = now + clampLockTtl(command.ttlMs);
+        current.expiresAt = PERSISTENT_EDIT_LOCK_EXPIRES_AT;
         current.updatedAt = now;
         return {
             ok: true,
@@ -904,121 +780,6 @@ function applyEditLockCommand(command) {
     return { ok: false, reason: 'invalid_action' };
 }
 
-function dateKeyFromTs(ts) {
-    const d = new Date(ts);
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return y + '-' + m + '-' + day;
-}
-
-function buildActivityPlayersOnly() {
-    const normalized = normalizeActivityState(state.activity);
-    return {
-        players: normalized.players,
-        buckets: {}
-    };
-}
-
-function buildActivityMetaForPlayer(playerKeyRaw) {
-    const playerKey = String(playerKeyRaw || '').trim();
-    const meta = {
-        playerKey: playerKey,
-        playerName: playerKey,
-        dates: [],
-        coords: []
-    };
-    if (!playerKey) {
-        return meta;
-    }
-
-    const normalized = normalizeActivityState(state.activity);
-    const player = normalized.players[playerKey];
-    if (player) {
-        meta.playerName = String(player.playerName || playerKey).trim() || playerKey;
-    }
-
-    const dates = new Set();
-    const coords = new Set();
-    Object.keys(normalized.buckets).forEach((idKey) => {
-        const rec = normalized.buckets[idKey];
-        if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
-            return;
-        }
-        if (String(rec.playerKey || '').trim() !== playerKey) {
-            return;
-        }
-        const bucketTs = safeNumber(rec.bucketTs, 0);
-        if (bucketTs > 0) {
-            dates.add(dateKeyFromTs(bucketTs));
-        }
-        const coord = normalizeCoord(rec.coords);
-        if (coord) {
-            coords.add(coord);
-        }
-    });
-
-    meta.dates = Array.from(dates).sort();
-    meta.coords = Array.from(coords).sort(compareCoords);
-    return meta;
-}
-
-function buildActivityForPlayerRange(playerKeyRaw, startTsRaw, endTsRaw, limitRaw) {
-    const activity = { players: {}, buckets: {} };
-    const playerKey = String(playerKeyRaw || '').trim();
-    if (!playerKey) {
-        return activity;
-    }
-
-    const normalized = normalizeActivityState(state.activity);
-    const listedPlayer = normalized.players[playerKey];
-    if (listedPlayer) {
-        activity.players[playerKey] = listedPlayer;
-    }
-
-    let startTs = safeNumber(startTsRaw, 0);
-    let endTs = safeNumber(endTsRaw, 0);
-    if (startTs > 0 && endTs > 0 && endTs < startTs) {
-        const tmp = startTs;
-        startTs = endTs;
-        endTs = tmp;
-    }
-    const hasStart = startTs > 0;
-    const hasEnd = endTs > 0;
-    const limit = Math.min(10000, Math.max(0, safeNumber(limitRaw, 0)));
-
-    const list = [];
-    Object.keys(normalized.buckets).forEach((idKey) => {
-        const rec = normalized.buckets[idKey];
-        if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
-            return;
-        }
-        if (String(rec.playerKey || '').trim() !== playerKey) {
-            return;
-        }
-        const bucketTs = safeNumber(rec.bucketTs, 0);
-        if (hasStart && bucketTs < startTs) {
-            return;
-        }
-        if (hasEnd && bucketTs > endTs) {
-            return;
-        }
-        list.push(rec);
-    });
-
-    list.sort((a, b) => safeNumber(a.bucketTs, 0) - safeNumber(b.bucketTs, 0));
-    const finalList = limit > 0 && list.length > limit
-        ? list.slice(list.length - limit)
-        : list;
-
-    finalList.forEach((rec) => {
-        const id = String(rec.id || (rec.playerKey + '|' + rec.coords + '|' + rec.bucketTs));
-        activity.buckets[id] = rec;
-    });
-
-    return activity;
-}
-
 function buildPublicState(includeActivity) {
     const now = Date.now();
     const payload = {
@@ -1027,7 +788,7 @@ function buildPublicState(includeActivity) {
         control: state.control,
         controlUpdatedAt: state.controlUpdatedAt,
         editLock: getPublicEditLock(now),
-        sharedCoords: getPublicSharedCoords(),
+        sharedCoords: buildPublicSharedCoords(),
         sharedCoordsUpdatedAt: Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), safeNumber(state.activityUpdatedAt, 0))
     };
     if (includeActivity) {
@@ -1041,40 +802,10 @@ function sendJson(res, statusCode, payload) {
     const body = JSON.stringify(payload);
     res.statusCode = statusCode;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-PTRE-Token, x-ptre-token');
     res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, OPTIONS');
     res.end(body);
-    return Buffer.byteLength(body, 'utf8');
-}
-
-function logRequest(req, reqUrl, statusCode, startedAt, responseBytes, extra) {
-    const durationMs = Date.now() - startedAt;
-    if (!LOG_ALL_REQUESTS && durationMs < SLOW_REQUEST_MS) {
-        return;
-    }
-    const parts = [
-        'method=' + String(req.method || ''),
-        'path=' + String((reqUrl && reqUrl.pathname) || '/'),
-        'status=' + String(statusCode),
-        'duration=' + durationMs + 'ms',
-        'bytes=' + Number(responseBytes || 0)
-    ];
-    if (reqUrl && reqUrl.search) {
-        parts.push('query=' + reqUrl.search.slice(1));
-    }
-    if (extra && typeof extra === 'object') {
-        Object.keys(extra).forEach((key) => {
-            if (!key) {
-                return;
-            }
-            parts.push(String(key) + '=' + String(extra[key]));
-        });
-    }
-    console.log('[targets-sync-server] request ' + parts.join(' '));
 }
 
 function isAuthorized(req) {
@@ -1109,19 +840,6 @@ function parseRequestUrl(req) {
     } catch (err) {
         return new URL('/targets', 'http://localhost');
     }
-}
-
-function parseBooleanFlag(value) {
-    const raw = String(value || '').trim().toLowerCase();
-    return raw === '1' || raw === 'true' || raw === 'yes';
-}
-
-function parsePositiveIntParam(value, fallback) {
-    const num = Number(value);
-    if (!Number.isFinite(num) || num <= 0) {
-        return fallback;
-    }
-    return Math.floor(num);
 }
 
 function parseUpdatePayload(payload) {
@@ -1183,70 +901,33 @@ function parseUpdatePayload(payload) {
 }
 
 const server = http.createServer(async (req, res) => {
-    const startedAt = Date.now();
     cleanupExpiredLock(Date.now());
-    const reqUrl = parseRequestUrl(req);
-    const send = (statusCode, payload, extra) => {
-        const bytes = sendJson(res, statusCode, payload);
-        logRequest(req, reqUrl, statusCode, startedAt, bytes, extra);
-    };
 
     if (req.method === 'OPTIONS') {
-        send(204, {}, null);
+        sendJson(res, 204, {});
         return;
     }
 
+    const reqUrl = parseRequestUrl(req);
     if (reqUrl.pathname !== '/targets') {
-        send(404, { error: 'not found' }, null);
+        sendJson(res, 404, { error: 'not found' });
         return;
     }
 
     if (!isAuthorized(req)) {
-        send(401, { error: 'unauthorized' }, null);
+        sendJson(res, 401, { error: 'unauthorized' });
         return;
     }
 
     if (req.method === 'GET') {
-        const includeActivity = parseBooleanFlag(reqUrl.searchParams.get('includeActivity'));
-        const historyOnly = parseBooleanFlag(reqUrl.searchParams.get('historyOnly'));
-        const activitySummary = parseBooleanFlag(reqUrl.searchParams.get('activitySummary'));
-        const activityMeta = parseBooleanFlag(reqUrl.searchParams.get('activityMeta'));
-        const activityPlayerKey = String(reqUrl.searchParams.get('activityPlayerKey') || '').trim();
-        const activityStartTs = parsePositiveIntParam(reqUrl.searchParams.get('activityStartTs'), 0);
-        const activityEndTs = parsePositiveIntParam(reqUrl.searchParams.get('activityEndTs'), 0);
-        const activityLimit = parsePositiveIntParam(reqUrl.searchParams.get('activityLimit'), 0);
-
-        const payload = historyOnly ? {} : buildPublicState(false);
-        if (includeActivity) {
-            payload.activity = state.activity;
-            payload.activityUpdatedAt = state.activityUpdatedAt;
-            send(200, payload, { includeActivity: 1 });
-            return;
-        }
-        if (activitySummary) {
-            payload.activity = buildActivityPlayersOnly();
-            payload.activityUpdatedAt = state.activityUpdatedAt;
-            send(200, payload, { activitySummary: 1 });
-            return;
-        }
-        if (activityMeta) {
-            payload.activityMeta = buildActivityMetaForPlayer(activityPlayerKey);
-            payload.activityUpdatedAt = state.activityUpdatedAt;
-            send(200, payload, { activityMeta: activityPlayerKey || 1 });
-            return;
-        }
-        if (activityPlayerKey) {
-            payload.activity = buildActivityForPlayerRange(activityPlayerKey, activityStartTs, activityEndTs, activityLimit);
-            payload.activityUpdatedAt = state.activityUpdatedAt;
-            send(200, payload, { activityPlayerKey: activityPlayerKey, activityLimit: activityLimit || 0 });
-            return;
-        }
-        send(200, payload, null);
+        const includeActivityRaw = String(reqUrl.searchParams.get('includeActivity') || '').toLowerCase();
+        const includeActivity = includeActivityRaw === '1' || includeActivityRaw === 'true' || includeActivityRaw === 'yes';
+        sendJson(res, 200, buildPublicState(includeActivity));
         return;
     }
 
     if (req.method !== 'PUT') {
-        send(405, { error: 'method not allowed' }, null);
+        sendJson(res, 405, { error: 'method not allowed' });
         return;
     }
 
@@ -1255,14 +936,12 @@ const server = http.createServer(async (req, res) => {
         const parsed = rawBody ? JSON.parse(rawBody) : {};
         const update = parseUpdatePayload(parsed);
         if (!update) {
-            send(400, { error: 'invalid payload' }, { requestBytes: rawBody.length });
+            sendJson(res, 400, { error: 'invalid payload' });
             return;
         }
         let stateChanged = false;
-        let persistNeeded = false;
         let lockResult = null;
         let clearActivityResult = null;
-        let sharedCoordsChanged = false;
         if (Object.prototype.hasOwnProperty.call(update, 'targets')) {
             state.targets = update.targets;
             state.updatedAt = update.updatedAt;
@@ -1270,32 +949,25 @@ const server = http.createServer(async (req, res) => {
             if (prunedActivity.removedAny) {
                 state.activity = prunedActivity.activity;
                 state.activityUpdatedAt = Math.max(safeNumber(state.activityUpdatedAt, 0), safeNumber(update.updatedAt, Date.now()));
-                sharedCoordsChanged = true;
             }
             const prunedSharedCoords = pruneSharedCoordsByTargets(state.sharedCoords, state.targets);
             if (prunedSharedCoords.removedAny) {
                 state.sharedCoords = prunedSharedCoords.sharedCoords;
                 state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), safeNumber(update.updatedAt, Date.now()));
-                sharedCoordsChanged = true;
             }
-            sharedCoordsChanged = true;
             stateChanged = true;
-            persistNeeded = true;
         }
         if (Object.prototype.hasOwnProperty.call(update, 'control')) {
             state.control = update.control;
             state.controlUpdatedAt = update.controlUpdatedAt;
             stateChanged = true;
-            persistNeeded = true;
         }
         if (Object.prototype.hasOwnProperty.call(update, 'activityBatch')) {
             const allowedBatch = filterActivityBatchByTargets(update.activityBatch, state.targets);
             if (allowedBatch.length > 0) {
                 state.activity = mergeActivityBatch(state.activity, allowedBatch);
                 state.activityUpdatedAt = update.activityUpdatedAt;
-                sharedCoordsChanged = true;
                 stateChanged = true;
-                persistNeeded = true;
             }
         }
         if (Object.prototype.hasOwnProperty.call(update, 'activityClearPlayerKey')) {
@@ -1312,11 +984,8 @@ const server = http.createServer(async (req, res) => {
                 if (Object.prototype.hasOwnProperty.call(state.sharedCoords, update.activityClearPlayerKey)) {
                     delete state.sharedCoords[update.activityClearPlayerKey];
                     state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), safeNumber(update.activityUpdatedAt, Date.now()));
-                    sharedCoordsChanged = true;
                 }
-                sharedCoordsChanged = true;
                 stateChanged = true;
-                persistNeeded = true;
             }
         }
         if (Object.prototype.hasOwnProperty.call(update, 'coordsBatch')) {
@@ -1324,9 +993,7 @@ const server = http.createServer(async (req, res) => {
             if (allowedBatch.length > 0) {
                 state.sharedCoords = mergeSharedCoordsBatch(state.sharedCoords, allowedBatch);
                 state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), update.coordsUpdatedAt);
-                sharedCoordsChanged = true;
                 stateChanged = true;
-                persistNeeded = true;
             }
         }
         if (Object.prototype.hasOwnProperty.call(update, 'editLockCommand')) {
@@ -1338,12 +1005,7 @@ const server = http.createServer(async (req, res) => {
             }
         }
         if (stateChanged) {
-            if (sharedCoordsChanged) {
-                invalidatePublicSharedCoordsCache();
-            }
-            if (persistNeeded) {
-                persistState();
-            }
+            persistState();
         }
         const response = buildPublicState(false);
         if (lockResult) {
@@ -1352,22 +1014,14 @@ const server = http.createServer(async (req, res) => {
         if (clearActivityResult) {
             response.clearActivityResult = clearActivityResult;
         }
-        send(200, response, {
-            requestBytes: rawBody.length,
-            stateChanged: stateChanged ? 1 : 0,
-            persist: persistNeeded ? 1 : 0
-        });
+        sendJson(res, 200, response);
     } catch (err) {
-        send(400, { error: err.message || 'bad request' }, null);
+        sendJson(res, 400, { error: err.message || 'bad request' });
     }
 });
 
-server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
-server.headersTimeout = HEADERS_TIMEOUT_MS;
-
 server.listen(PORT, HOST, () => {
     console.log('[targets-sync-server] listening on http://' + HOST + ':' + PORT + '/targets');
-    console.log('[targets-sync-server] keepAliveTimeout=' + server.keepAliveTimeout + 'ms headersTimeout=' + server.headersTimeout + 'ms');
     if (!SYNC_TOKEN) {
         console.log('[targets-sync-server] warning: SYNC_TOKEN is empty');
     }
