@@ -14,6 +14,8 @@ const PERSIST_DEBOUNCE_MS = Math.max(100, Number(process.env.PERSIST_DEBOUNCE_MS
 const SLOW_REQUEST_MS = Math.max(250, Number(process.env.SLOW_REQUEST_MS || 1200));
 const SLOW_PERSIST_MS = Math.max(250, Number(process.env.SLOW_PERSIST_MS || 800));
 const LOG_ALL_REQUESTS = /^(1|true|yes)$/i.test(String(process.env.LOG_ALL_REQUESTS || '').trim());
+const KEEP_ALIVE_TIMEOUT_MS = Math.max(10000, Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 65000));
+const HEADERS_TIMEOUT_MS = Math.max(KEEP_ALIVE_TIMEOUT_MS + 5000, Number(process.env.HEADERS_TIMEOUT_MS || (KEEP_ALIVE_TIMEOUT_MS + 5000)));
 const EDIT_LOCK_DEFAULT_TTL_MS = 2 * 60 * 1000;
 const EDIT_LOCK_MIN_TTL_MS = 30 * 1000;
 const EDIT_LOCK_MAX_TTL_MS = 15 * 60 * 1000;
@@ -1039,6 +1041,9 @@ function sendJson(res, statusCode, payload) {
     const body = JSON.stringify(payload);
     res.statusCode = statusCode;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-PTRE-Token, x-ptre-token');
     res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, OPTIONS');
@@ -1357,8 +1362,12 @@ const server = http.createServer(async (req, res) => {
     }
 });
 
+server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+server.headersTimeout = HEADERS_TIMEOUT_MS;
+
 server.listen(PORT, HOST, () => {
     console.log('[targets-sync-server] listening on http://' + HOST + ':' + PORT + '/targets');
+    console.log('[targets-sync-server] keepAliveTimeout=' + server.keepAliveTimeout + 'ms headersTimeout=' + server.headersTimeout + 'ms');
     if (!SYNC_TOKEN) {
         console.log('[targets-sync-server] warning: SYNC_TOKEN is empty');
     }
