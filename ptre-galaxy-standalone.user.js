@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.46
+// @version      0.7.47
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -50,6 +50,7 @@
     const RESET_LOCAL_ID = 'ptreLocalResetLocal';
     const DEBUG_TOGGLE_ID = 'ptreLocalDebugToggle';
     const DEBUG_DUMP_ID = 'ptreLocalDebugDump';
+    const DEBUG_CLEAR_ID = 'ptreLocalDebugClear';
     const DEBUG_STATUS_ID = 'ptreLocalDebugStatus';
     const SYNC_STATUS_ID = 'ptreLocalSyncStatus';
     const EXECUTE_SLAVE_ID = 'ptreLocalExecuteOnSlave';
@@ -347,6 +348,7 @@
             <div class="ptreLocalRow">
                 <button id="${DEBUG_TOGGLE_ID}" class="ptreLocalButton ptreLocalButtonWarn">Debug: off</button>
                 <button id="${DEBUG_DUMP_ID}" class="ptreLocalButton">Ver debug</button>
+                <button id="${DEBUG_CLEAR_ID}" class="ptreLocalButton">Limpiar debug</button>
             </div>
             <div id="${DEBUG_STATUS_ID}" class="ptreLocalSyncStatus">Debug: off</div>
             <div id="${EDIT_LOCK_STATUS_ID}" class="ptreLocalEditStatus">Edición: local</div>
@@ -414,6 +416,11 @@
         if (debugDumpBtn && !debugDumpBtn.dataset.bound) {
             debugDumpBtn.dataset.bound = 'true';
             debugDumpBtn.addEventListener('click', openDebugDumpWindow);
+        }
+        const debugClearBtn = document.getElementById(DEBUG_CLEAR_ID);
+        if (debugClearBtn && !debugClearBtn.dataset.bound) {
+            debugClearBtn.dataset.bound = 'true';
+            debugClearBtn.addEventListener('click', clearDebugEntries);
         }
         const resetLocalBtn = document.getElementById(RESET_LOCAL_ID);
         if (resetLocalBtn && !resetLocalBtn.dataset.bound) {
@@ -708,11 +715,15 @@
         const statusEl = document.getElementById(DEBUG_STATUS_ID);
         const toggleBtn = document.getElementById(DEBUG_TOGGLE_ID);
         const dumpBtn = document.getElementById(DEBUG_DUMP_ID);
+        const clearBtn = document.getElementById(DEBUG_CLEAR_ID);
         if (toggleBtn) {
             toggleBtn.textContent = 'Debug: ' + (debugEnabled ? 'on' : 'off');
         }
         if (dumpBtn) {
             dumpBtn.disabled = debugEntries.length === 0;
+        }
+        if (clearBtn) {
+            clearBtn.disabled = debugEntries.length === 0 && !debugLastHint;
         }
         if (!statusEl) {
             return;
@@ -736,6 +747,23 @@
         if (kind) {
             statusEl.classList.add(kind);
         }
+    }
+
+    function clearDebugEntries() {
+        if (debugEntries.length === 0 && !debugLastHint) {
+            renderDebugStatus();
+            return;
+        }
+        debugEntries = [];
+        debugLastHint = '';
+        debugLastStatusMessage = '';
+        debugSessionId = generateLocalId('ptre-debug');
+        if (debugPersistTimer) {
+            clearTimeout(debugPersistTimer);
+            debugPersistTimer = null;
+        }
+        GM_setValue(KEY_DEBUG_LOG, '[]');
+        renderDebugStatus();
     }
 
     function stopDebugTools() {
