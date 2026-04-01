@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.48
+// @version      0.7.49
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -87,6 +87,14 @@
     const DEFAULT_SYNC_ENDPOINT = ''; // Example: http://YOUR_VPS_IP:8787/targets
     const DEFAULT_SYNC_TOKEN = ''; // Must match X-PTRE-Token expected by your VPS endpoint.
     const SYNC_PULL_INTERVAL_MS = 5000;
+    const SYNC_PULL_SLOW_MS = 2000;
+    const SYNC_PULL_VERY_SLOW_MS = 5000;
+    const SYNC_PULL_SEVERE_MS = 12000;
+    const SYNC_PULL_BACKOFF_SLOW_MS = 15000;
+    const SYNC_PULL_BACKOFF_VERY_SLOW_MS = 30000;
+    const SYNC_PULL_BACKOFF_SEVERE_MS = 60000;
+    const SYNC_PULL_BACKOFF_ERROR_BASE_MS = 15000;
+    const SYNC_PULL_BACKOFF_ERROR_MAX_MS = 60000;
     const SYNC_PUSH_DEBOUNCE_MS = 700;
     const SYNC_ACTIVITY_PUSH_DEBOUNCE_MS = 1000;
     const SYNC_ACTIVITY_BATCH_SIZE = 80;
@@ -199,6 +207,8 @@
     let syncRemoteCoordsSerialized = '';
     let syncOnline = false;
     let syncLastError = '';
+    let syncPullFailureStreak = 0;
+    let syncPullLastDelayMs = Math.max(2000, Number(SYNC_PULL_INTERVAL_MS) || 5000);
     let syncRemoteEditLock = null;
     let syncEditLockHeartbeatTimer = null;
     let syncEditLockClaimInFlight = false;
@@ -731,6 +741,8 @@
             scanQueueLength: Array.isArray(scanQueue) ? scanQueue.length : 0,
             pendingActivity: Array.isArray(syncPendingActivity) ? syncPendingActivity.length : 0,
             pendingCoords: Array.isArray(syncPendingCoords) ? syncPendingCoords.length : 0,
+            syncPullDelayMs: syncPullLastDelayMs,
+            syncPullFailureStreak: syncPullFailureStreak,
             lastGalaxy: lastGalaxy,
             lastSystem: lastSystem,
             galaxyLoadState: galaxyLoadState,
@@ -897,6 +909,11 @@
             stopEditLockHeartbeat();
         }
         persistDebugSyncSwitches();
+        if (isDebugSyncSwitchEnabled('pullGet') && isSyncEnabled() && isSyncConfigured() && !syncPullInFlight && !syncPullTimer) {
+            scheduleNextSyncPull(mode === 'getOnly' ? getBaseSyncPullDelayMs() : 250, 'preset resume', {
+                mode: mode
+            });
+        }
         if (debugEnabled) {
             recordDebugEntry('debug.sync', mode === 'getOnly' ? 'Preset Solo GET' : 'Preset Todo on', {
                 disabled: getDisabledDebugSyncLabels()
@@ -915,6 +932,17 @@
             stopEditLockHeartbeat();
         }
         persistDebugSyncSwitches();
+        if (targetKey === 'pullGet') {
+            if (!enabled && syncPullTimer) {
+                clearTimeout(syncPullTimer);
+                syncPullTimer = null;
+                syncPullLastDelayMs = 0;
+            } else if (enabled && isSyncEnabled() && isSyncConfigured() && !syncPullInFlight && !syncPullTimer) {
+                scheduleNextSyncPull(250, 'switch resume', {
+                    key: targetKey
+                });
+            }
+        }
         if (debugEnabled) {
             recordDebugEntry('debug.sync', 'Switch ' + targetKey + '=' + (enabled ? 'on' : 'off'), {
                 disabled: getDisabledDebugSyncLabels()
@@ -1258,6 +1286,8 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         syncRemoteCoordsSerialized = '';
         syncOnline = false;
         syncLastError = '';
+        syncPullFailureStreak = 0;
+        syncPullLastDelayMs = getBaseSyncPullDelayMs();
         syncRemoteEditLock = null;
         syncEditLockClaimInFlight = false;
         syncEditLockLastClaimAt = 0;
@@ -2666,6 +2696,53 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         });
     }
 
+    function getBaseSyncPullDelayMs() {
+        return Math.max(2000, Number(SYNC_PULL_INTERVAL_MS) || 5000);
+    }
+
+    function computeNextSyncPullDelay(durationMs, hadError) {
+        const baseDelay = getBaseSyncPullDelayMs();
+        if (hadError) {
+            syncPullFailureStreak += 1;
+            const boosted = SYNC_PULL_BACKOFF_ERROR_BASE_MS * Math.pow(2, Math.max(0, syncPullFailureStreak - 1));
+            return Math.min(SYNC_PULL_BACKOFF_ERROR_MAX_MS, Math.max(baseDelay, boosted));
+        }
+        syncPullFailureStreak = 0;
+        const duration = Math.max(0, Number(durationMs) || 0);
+        if (duration >= SYNC_PULL_SEVERE_MS) {
+            return Math.max(baseDelay, SYNC_PULL_BACKOFF_SEVERE_MS);
+        }
+        if (duration >= SYNC_PULL_VERY_SLOW_MS) {
+            return Math.max(baseDelay, SYNC_PULL_BACKOFF_VERY_SLOW_MS);
+        }
+        if (duration >= SYNC_PULL_SLOW_MS) {
+            return Math.max(baseDelay, SYNC_PULL_BACKOFF_SLOW_MS);
+        }
+        return baseDelay;
+    }
+
+    function scheduleNextSyncPull(delayMs, reason, extra) {
+        if (syncPullTimer) {
+            clearTimeout(syncPullTimer);
+            syncPullTimer = null;
+        }
+        if (!isSyncEnabled() || !isSyncConfigured() || !isDebugSyncSwitchEnabled('pullGet')) {
+            syncPullLastDelayMs = 0;
+            return;
+        }
+        const delay = Math.max(500, Number(delayMs) || getBaseSyncPullDelayMs());
+        syncPullLastDelayMs = delay;
+        syncPullTimer = setTimeout(() => {
+            syncPullTimer = null;
+            pullTargetsFromRemote(false);
+        }, delay);
+        if (debugEnabled && (delay > getBaseSyncPullDelayMs() || reason)) {
+            recordDebugEntry('sync.pull.schedule', String(reason || 'scheduled'), Object.assign({
+                delayMs: delay
+            }, extra && typeof extra === 'object' ? extra : {}));
+        }
+    }
+
     function applyRemoteControlCommand(payload) {
         if (!isDebugSyncSwitchEnabled('applyControl')) {
             return;
@@ -2728,6 +2805,8 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         if (!isSyncEnabled() || !isSyncConfigured() || syncPullInFlight || !isDebugSyncSwitchEnabled('pullGet')) {
             return;
         }
+        const startedAt = nowPerfMs();
+        let hadError = false;
         markDebugRate('pullTargetsFromRemote', 6, 5000, {
             force: Boolean(force),
             mode: syncMode
@@ -2766,12 +2845,22 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
                 hasControl: Boolean(payload && payload.control)
             });
         }).catch((err) => {
+            hadError = true;
             console.warn('[PTRE sync] pull failed:', err);
             recordDebugEntry('sync.pull', err && err.message ? err.message : 'pull failed', {
                 force: Boolean(force)
             }, 'warn');
         }).finally(() => {
             syncPullInFlight = false;
+            if (!resetInProgress && isSyncEnabled() && isSyncConfigured() && isDebugSyncSwitchEnabled('pullGet')) {
+                const durationMs = Math.round(nowPerfMs() - startedAt);
+                const nextDelayMs = computeNextSyncPullDelay(durationMs, hadError);
+                scheduleNextSyncPull(nextDelayMs, hadError ? 'backoff error' : (nextDelayMs > getBaseSyncPullDelayMs() ? 'backoff slow' : 'steady'), {
+                    durationMs: durationMs,
+                    force: Boolean(force),
+                    failureStreak: syncPullFailureStreak
+                });
+            }
         });
     }
 
@@ -2799,21 +2888,20 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         setSyncOffline('');
         refreshExecuteSlaveToggle();
         renderEditLockStatus();
+        syncPullFailureStreak = 0;
+        syncPullLastDelayMs = getBaseSyncPullDelayMs();
+        if (syncPullTimer) {
+            clearTimeout(syncPullTimer);
+            syncPullTimer = null;
+        }
         pullTargetsFromRemote(true);
         queueHostTargetsSync(loadTargets());
-        if (syncPullTimer) {
-            clearInterval(syncPullTimer);
-        }
-        const pollMs = Math.max(2000, Number(SYNC_PULL_INTERVAL_MS) || 5000);
-        syncPullTimer = setInterval(() => {
-            pullTargetsFromRemote(false);
-        }, pollMs);
     }
 
     function stopTargetsSync() {
         recordDebugEntry('sync', 'stopTargetsSync', buildDebugSnapshot());
         if (syncPullTimer) {
-            clearInterval(syncPullTimer);
+            clearTimeout(syncPullTimer);
             syncPullTimer = null;
         }
         if (syncPushTimer) {
@@ -2842,6 +2930,8 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         syncRemoteCoordsByPlayer = {};
         syncRemoteCoordsUpdatedAt = 0;
         syncRemoteCoordsSerialized = '';
+        syncPullFailureStreak = 0;
+        syncPullLastDelayMs = 0;
         syncRemoteEditLock = null;
         setSyncOffline('');
         refreshExecuteSlaveToggle();
