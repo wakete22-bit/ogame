@@ -11,6 +11,9 @@ const SYNC_TOKEN = process.env.SYNC_TOKEN || '';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'targets-store.json');
 const MAX_BODY_BYTES = 1024 * 1024;
 const PERSIST_DEBOUNCE_MS = Math.max(100, Number(process.env.PERSIST_DEBOUNCE_MS || 750));
+const SLOW_REQUEST_MS = Math.max(250, Number(process.env.SLOW_REQUEST_MS || 1200));
+const SLOW_PERSIST_MS = Math.max(250, Number(process.env.SLOW_PERSIST_MS || 800));
+const LOG_ALL_REQUESTS = /^(1|true|yes)$/i.test(String(process.env.LOG_ALL_REQUESTS || '').trim());
 const EDIT_LOCK_DEFAULT_TTL_MS = 2 * 60 * 1000;
 const EDIT_LOCK_MIN_TTL_MS = 30 * 1000;
 const EDIT_LOCK_MAX_TTL_MS = 15 * 60 * 1000;
@@ -670,6 +673,8 @@ if (startupPrunedActivity.removedAny || startupPrunedSharedCoords.removedAny) {
 }
 
 let persistTimer = null;
+let persistDirty = false;
+let persistInFlight = false;
 let publicSharedCoordsCache = {};
 let publicSharedCoordsDirty = true;
 
@@ -686,32 +691,91 @@ function getPublicSharedCoords() {
     return publicSharedCoordsCache;
 }
 
+function logPersistResult(durationMs, bytes, err) {
+    if (err) {
+        console.warn('[targets-sync-server] persist failed:', err && err.message ? err.message : err);
+        return;
+    }
+    if (!LOG_ALL_REQUESTS && durationMs < SLOW_PERSIST_MS) {
+        return;
+    }
+    console.log('[targets-sync-server] persist ok duration=' + durationMs + 'ms bytes=' + bytes);
+}
+
 function persistStateSync() {
     const tmpFile = DATA_FILE + '.tmp';
-    fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2), 'utf8');
+    const startedAt = Date.now();
+    const body = JSON.stringify(state);
+    fs.writeFileSync(tmpFile, body, 'utf8');
     fs.renameSync(tmpFile, DATA_FILE);
+    logPersistResult(Date.now() - startedAt, Buffer.byteLength(body, 'utf8'), null);
+}
+
+function flushPersistAsync() {
+    if (!persistDirty || persistInFlight) {
+        return;
+    }
+    const tmpFile = DATA_FILE + '.tmp';
+    let body = '';
+    const startedAt = Date.now();
+    persistDirty = false;
+    persistInFlight = true;
+
+    try {
+        body = JSON.stringify(state);
+    } catch (err) {
+        persistInFlight = false;
+        persistDirty = true;
+        console.warn('[targets-sync-server] persist failed:', err && err.message ? err.message : err);
+        persistState();
+        return;
+    }
+
+    const byteLength = Buffer.byteLength(body, 'utf8');
+    fs.writeFile(tmpFile, body, 'utf8', (writeErr) => {
+        if (writeErr) {
+            persistInFlight = false;
+            persistDirty = true;
+            logPersistResult(Date.now() - startedAt, byteLength, writeErr);
+            persistState();
+            return;
+        }
+        fs.rename(tmpFile, DATA_FILE, (renameErr) => {
+            persistInFlight = false;
+            if (renameErr) {
+                persistDirty = true;
+                logPersistResult(Date.now() - startedAt, byteLength, renameErr);
+                persistState();
+                return;
+            }
+            logPersistResult(Date.now() - startedAt, byteLength, null);
+            if (persistDirty) {
+                persistState();
+            }
+        });
+    });
 }
 
 function persistState() {
+    persistDirty = true;
     if (persistTimer) {
         return;
     }
     persistTimer = setTimeout(() => {
         persistTimer = null;
-        try {
-            persistStateSync();
-        } catch (err) {
-            console.warn('[targets-sync-server] persist failed:', err && err.message ? err.message : err);
-        }
+        flushPersistAsync();
     }, PERSIST_DEBOUNCE_MS);
 }
 
 function flushPendingPersist() {
-    if (!persistTimer) {
+    if (persistTimer) {
+        clearTimeout(persistTimer);
+        persistTimer = null;
+    }
+    if (!persistDirty && !persistInFlight) {
         return;
     }
-    clearTimeout(persistTimer);
-    persistTimer = null;
+    persistDirty = false;
     persistStateSync();
 }
 
@@ -979,6 +1043,33 @@ function sendJson(res, statusCode, payload) {
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-PTRE-Token, x-ptre-token');
     res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, OPTIONS');
     res.end(body);
+    return Buffer.byteLength(body, 'utf8');
+}
+
+function logRequest(req, reqUrl, statusCode, startedAt, responseBytes, extra) {
+    const durationMs = Date.now() - startedAt;
+    if (!LOG_ALL_REQUESTS && durationMs < SLOW_REQUEST_MS) {
+        return;
+    }
+    const parts = [
+        'method=' + String(req.method || ''),
+        'path=' + String((reqUrl && reqUrl.pathname) || '/'),
+        'status=' + String(statusCode),
+        'duration=' + durationMs + 'ms',
+        'bytes=' + Number(responseBytes || 0)
+    ];
+    if (reqUrl && reqUrl.search) {
+        parts.push('query=' + reqUrl.search.slice(1));
+    }
+    if (extra && typeof extra === 'object') {
+        Object.keys(extra).forEach((key) => {
+            if (!key) {
+                return;
+            }
+            parts.push(String(key) + '=' + String(extra[key]));
+        });
+    }
+    console.log('[targets-sync-server] request ' + parts.join(' '));
 }
 
 function isAuthorized(req) {
@@ -1087,21 +1178,26 @@ function parseUpdatePayload(payload) {
 }
 
 const server = http.createServer(async (req, res) => {
+    const startedAt = Date.now();
     cleanupExpiredLock(Date.now());
+    const reqUrl = parseRequestUrl(req);
+    const send = (statusCode, payload, extra) => {
+        const bytes = sendJson(res, statusCode, payload);
+        logRequest(req, reqUrl, statusCode, startedAt, bytes, extra);
+    };
 
     if (req.method === 'OPTIONS') {
-        sendJson(res, 204, {});
+        send(204, {}, null);
         return;
     }
 
-    const reqUrl = parseRequestUrl(req);
     if (reqUrl.pathname !== '/targets') {
-        sendJson(res, 404, { error: 'not found' });
+        send(404, { error: 'not found' }, null);
         return;
     }
 
     if (!isAuthorized(req)) {
-        sendJson(res, 401, { error: 'unauthorized' });
+        send(401, { error: 'unauthorized' }, null);
         return;
     }
 
@@ -1119,33 +1215,33 @@ const server = http.createServer(async (req, res) => {
         if (includeActivity) {
             payload.activity = state.activity;
             payload.activityUpdatedAt = state.activityUpdatedAt;
-            sendJson(res, 200, payload);
+            send(200, payload, { includeActivity: 1 });
             return;
         }
         if (activitySummary) {
             payload.activity = buildActivityPlayersOnly();
             payload.activityUpdatedAt = state.activityUpdatedAt;
-            sendJson(res, 200, payload);
+            send(200, payload, { activitySummary: 1 });
             return;
         }
         if (activityMeta) {
             payload.activityMeta = buildActivityMetaForPlayer(activityPlayerKey);
             payload.activityUpdatedAt = state.activityUpdatedAt;
-            sendJson(res, 200, payload);
+            send(200, payload, { activityMeta: activityPlayerKey || 1 });
             return;
         }
         if (activityPlayerKey) {
             payload.activity = buildActivityForPlayerRange(activityPlayerKey, activityStartTs, activityEndTs, activityLimit);
             payload.activityUpdatedAt = state.activityUpdatedAt;
-            sendJson(res, 200, payload);
+            send(200, payload, { activityPlayerKey: activityPlayerKey, activityLimit: activityLimit || 0 });
             return;
         }
-        sendJson(res, 200, payload);
+        send(200, payload, null);
         return;
     }
 
     if (req.method !== 'PUT') {
-        sendJson(res, 405, { error: 'method not allowed' });
+        send(405, { error: 'method not allowed' }, null);
         return;
     }
 
@@ -1154,10 +1250,11 @@ const server = http.createServer(async (req, res) => {
         const parsed = rawBody ? JSON.parse(rawBody) : {};
         const update = parseUpdatePayload(parsed);
         if (!update) {
-            sendJson(res, 400, { error: 'invalid payload' });
+            send(400, { error: 'invalid payload' }, { requestBytes: rawBody.length });
             return;
         }
         let stateChanged = false;
+        let persistNeeded = false;
         let lockResult = null;
         let clearActivityResult = null;
         let sharedCoordsChanged = false;
@@ -1178,11 +1275,13 @@ const server = http.createServer(async (req, res) => {
             }
             sharedCoordsChanged = true;
             stateChanged = true;
+            persistNeeded = true;
         }
         if (Object.prototype.hasOwnProperty.call(update, 'control')) {
             state.control = update.control;
             state.controlUpdatedAt = update.controlUpdatedAt;
             stateChanged = true;
+            persistNeeded = true;
         }
         if (Object.prototype.hasOwnProperty.call(update, 'activityBatch')) {
             const allowedBatch = filterActivityBatchByTargets(update.activityBatch, state.targets);
@@ -1191,6 +1290,7 @@ const server = http.createServer(async (req, res) => {
                 state.activityUpdatedAt = update.activityUpdatedAt;
                 sharedCoordsChanged = true;
                 stateChanged = true;
+                persistNeeded = true;
             }
         }
         if (Object.prototype.hasOwnProperty.call(update, 'activityClearPlayerKey')) {
@@ -1211,6 +1311,7 @@ const server = http.createServer(async (req, res) => {
                 }
                 sharedCoordsChanged = true;
                 stateChanged = true;
+                persistNeeded = true;
             }
         }
         if (Object.prototype.hasOwnProperty.call(update, 'coordsBatch')) {
@@ -1220,6 +1321,7 @@ const server = http.createServer(async (req, res) => {
                 state.sharedCoordsUpdatedAt = Math.max(safeNumber(state.sharedCoordsUpdatedAt, 0), update.coordsUpdatedAt);
                 sharedCoordsChanged = true;
                 stateChanged = true;
+                persistNeeded = true;
             }
         }
         if (Object.prototype.hasOwnProperty.call(update, 'editLockCommand')) {
@@ -1234,7 +1336,9 @@ const server = http.createServer(async (req, res) => {
             if (sharedCoordsChanged) {
                 invalidatePublicSharedCoordsCache();
             }
-            persistState();
+            if (persistNeeded) {
+                persistState();
+            }
         }
         const response = buildPublicState(false);
         if (lockResult) {
@@ -1243,9 +1347,13 @@ const server = http.createServer(async (req, res) => {
         if (clearActivityResult) {
             response.clearActivityResult = clearActivityResult;
         }
-        sendJson(res, 200, response);
+        send(200, response, {
+            requestBytes: rawBody.length,
+            stateChanged: stateChanged ? 1 : 0,
+            persist: persistNeeded ? 1 : 0
+        });
     } catch (err) {
-        sendJson(res, 400, { error: err.message || 'bad request' });
+        send(400, { error: err.message || 'bad request' }, null);
     }
 });
 
