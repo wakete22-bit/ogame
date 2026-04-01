@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.41.2
+// @version      0.7.41.3
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -50,6 +50,7 @@
     const EDIT_LOCK_STATUS_ID = 'ptreLocalEditLockStatus';
     const EDIT_LOCK_TAKE_ID = 'ptreLocalEditLockTake';
     const EDIT_LOCK_PASS_ID = 'ptreLocalEditLockPass';
+    const DELETE_TARGET_PLAYER_ID = 'ptreLocalDeletePlayer';
 
     const DB_NAME = 'ptreLocalActivityDB';
     const DB_VERSION = 3;
@@ -313,6 +314,7 @@
             <div class="ptreLocalRow">
                 <button id="${EDIT_LOCK_TAKE_ID}" class="ptreLocalButton">Tomar control</button>
                 <button id="${EDIT_LOCK_PASS_ID}" class="ptreLocalButton">Pasar control</button>
+                <button id="${DELETE_TARGET_PLAYER_ID}" class="ptreLocalButton">Eliminar jugador</button>
             </div>
             <div class="ptreLocalSection">
                 <div class="ptreLocalSectionTitle">Objetivos</div>
@@ -390,6 +392,13 @@
                 passEditControl();
             });
         }
+        const deletePlayerBtn = document.getElementById(DELETE_TARGET_PLAYER_ID);
+        if (deletePlayerBtn && !deletePlayerBtn.dataset.bound) {
+            deletePlayerBtn.dataset.bound = 'true';
+            deletePlayerBtn.addEventListener('click', () => {
+                deleteSelectedTargetPlayer();
+            });
+        }
         updateSyncButtonLabel();
         renderSyncStatus();
         renderEditLockStatus();
@@ -399,6 +408,7 @@
             targetSelect.addEventListener('change', () => {
                 GM_setValue(KEY_LAST_TARGET, targetSelect.value || '');
                 showCoordsForPlayer(targetSelect.value);
+                updateDeletePlayerButtonState();
             });
         }
         const speedSelect = document.getElementById(SCAN_SPEED_ID);
@@ -630,6 +640,7 @@
         if (passBtn) {
             passBtn.disabled = !canPassEditControl();
         }
+        updateDeletePlayerButtonState();
     }
 
     function updateRemoteEditLockFromPayload(payload) {
@@ -1940,6 +1951,64 @@
         });
     }
 
+    function updateDeletePlayerButtonState() {
+        const btn = document.getElementById(DELETE_TARGET_PLAYER_ID);
+        const targetSelect = document.getElementById(TARGET_SELECT_ID);
+        if (!btn) {
+            return;
+        }
+        const playerKey = targetSelect ? String(targetSelect.value || '').trim() : '';
+        const canDelete = Boolean(playerKey) && (!isSyncEnabled() || canEditSharedTargets());
+        btn.disabled = !canDelete;
+        if (!playerKey) {
+            btn.title = 'Selecciona un jugador';
+            return;
+        }
+        if (isSyncEnabled() && !canEditSharedTargets()) {
+            btn.title = getEditBlockedMessage() || 'Objetivos bloqueados';
+            return;
+        }
+        btn.title = 'Borrar jugador seleccionado';
+    }
+
+    function deleteSelectedTargetPlayer() {
+        const targetSelect = document.getElementById(TARGET_SELECT_ID);
+        const playerKey = targetSelect ? String(targetSelect.value || '').trim() : '';
+        if (!playerKey) {
+            setStatus('Selecciona un jugador');
+            updateDeletePlayerButtonState();
+            return;
+        }
+        if (isSyncEnabled() && !canEditSharedTargets()) {
+            setStatus(getEditBlockedMessage() || 'Objetivos bloqueados');
+            updateDeletePlayerButtonState();
+            return;
+        }
+        const targets = loadTargets();
+        if (!targets[playerKey]) {
+            setStatus('Jugador no encontrado en objetivos');
+            updateTargetPanel();
+            return;
+        }
+        const label = String(targets[playerKey].name || playerKey).trim() || playerKey;
+        if (!window.confirm('¿Borrar "' + label + '" y quitarlo de objetivos?')) {
+            return;
+        }
+        delete targets[playerKey];
+        if (GM_getValue(KEY_LAST_TARGET, '') === playerKey) {
+            GM_setValue(KEY_LAST_TARGET, '');
+        }
+        if (Object.prototype.hasOwnProperty.call(syncRemoteCoordsByPlayer, playerKey)) {
+            delete syncRemoteCoordsByPlayer[playerKey];
+            syncRemoteCoordsSerialized = JSON.stringify(syncRemoteCoordsByPlayer);
+        }
+        syncPendingActivity = syncPendingActivity.filter((item) => item && item.playerKey !== playerKey);
+        syncPendingCoords = syncPendingCoords.filter((item) => item && item.playerKey !== playerKey);
+        saveTargets(targets);
+        updateTargetPanel();
+        setStatus('Jugador borrado: ' + label);
+    }
+
 
     function ensureLobbyPanel() {
         let panel = document.getElementById(LOBBY_PANEL_ID);
@@ -2668,6 +2737,7 @@
         if (keys.length === 0) {
             coordsContainer.textContent = 'Sin objetivos';
             refreshTargetIcons();
+            updateDeletePlayerButtonState();
             return;
         }
         keys.forEach((key) => {
@@ -2685,6 +2755,7 @@
         }
         updateOptionNamesFromDb(keys, targets, targetSelect);
         refreshTargetIcons();
+        updateDeletePlayerButtonState();
     }
 
     function updateOptionNamesFromDb(keys, targets, targetSelect) {
