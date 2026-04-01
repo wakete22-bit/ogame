@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.45
+// @version      0.7.46
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
@@ -102,6 +102,8 @@
     const DEBUG_PERSIST_DEBOUNCE_MS = 2000;
     const DEBUG_LAG_INTERVAL_MS = 1000;
     const DEBUG_LAG_WARN_MS = 2000;
+    const DEBUG_SYNC_STAGE_INFO_MS = 40;
+    const DEBUG_SYNC_STAGE_WARN_MS = 120;
 
     const isLobby = location.hostname === 'lobby.ogame.gameforge.com' || /\/lobby/i.test(location.pathname);
     if (isLobby) {
@@ -680,6 +682,28 @@
         }
     }
 
+    function nowPerfMs() {
+        if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+            return performance.now();
+        }
+        return Date.now();
+    }
+
+    function recordSlowDebugStage(scope, message, startedAt, extra) {
+        if (!debugEnabled) {
+            return 0;
+        }
+        const durationMs = Math.round(nowPerfMs() - startedAt);
+        if (durationMs < DEBUG_SYNC_STAGE_INFO_MS) {
+            return durationMs;
+        }
+        const payload = Object.assign({
+            durationMs: durationMs
+        }, extra && typeof extra === 'object' ? extra : {});
+        recordDebugEntry(scope, message, payload, durationMs >= DEBUG_SYNC_STAGE_WARN_MS ? 'warn' : 'info');
+        return durationMs;
+    }
+
     function renderDebugStatus() {
         const statusEl = document.getElementById(DEBUG_STATUS_ID);
         const toggleBtn = document.getElementById(DEBUG_TOGGLE_ID);
@@ -1174,6 +1198,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function renderEditLockStatus() {
+        const startedAt = nowPerfMs();
         const el = document.getElementById(EDIT_LOCK_STATUS_ID);
         const takeBtn = document.getElementById(EDIT_LOCK_TAKE_ID);
         const passBtn = document.getElementById(EDIT_LOCK_PASS_ID);
@@ -1217,15 +1242,27 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         if (passBtn) {
             passBtn.disabled = !canPassEditControl();
         }
+        recordSlowDebugStage('sync.apply', 'renderEditLockStatus', startedAt, {
+            lockOwner: syncRemoteEditLock && syncRemoteEditLock.ownerId ? syncRemoteEditLock.ownerId : '',
+            localOwner: isLocalEditorLockOwner()
+        });
     }
 
     function updateRemoteEditLockFromPayload(payload) {
+        const startedAt = nowPerfMs();
         syncRemoteEditLock = normalizeRemoteEditLock(payload);
         renderEditLockStatus();
         refreshTargetIcons();
+        let autoClaimed = false;
         if (!isRemoteLockActive(syncRemoteEditLock)) {
+            autoClaimed = true;
             maybeAutoClaimEditLockIfMissing();
         }
+        recordSlowDebugStage('sync.apply', 'applyRemoteEditLock', startedAt, {
+            hasLock: Boolean(syncRemoteEditLock),
+            ownerId: syncRemoteEditLock && syncRemoteEditLock.ownerId ? syncRemoteEditLock.ownerId : '',
+            autoClaimed: autoClaimed
+        });
     }
 
     function canPushTargetsSync() {
@@ -1958,6 +1995,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function applyRemoteSharedCoordsFromPayload(payload, force, onApplied) {
+        const startedAt = nowPerfMs();
         const remote = parseRemoteSharedCoordsPayload(payload);
         if (!remote) {
             return false;
@@ -1975,6 +2013,11 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         if (typeof onApplied === 'function') {
             onApplied();
         }
+        recordSlowDebugStage('sync.apply', 'applyRemoteSharedCoords', startedAt, {
+            force: Boolean(force),
+            playerCount: Object.keys(remote.coordsByPlayer).length,
+            payloadBytes: remoteSerialized.length
+        });
         return true;
     }
 
@@ -1991,12 +2034,17 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function applyRemoteTargetsFromPayload(payload, force, onApplied) {
+        const startedAt = nowPerfMs();
         const remote = parseRemoteTargetsPayload(payload);
         if (!remote) {
             return false;
         }
         const remoteSerialized = JSON.stringify(remote.targets);
+        const localLoadStartedAt = nowPerfMs();
         const localSerialized = JSON.stringify(loadTargets());
+        recordSlowDebugStage('sync.apply', 'loadLocalTargetsForCompare', localLoadStartedAt, {
+            payloadBytes: localSerialized.length
+        });
         const hasChange = Boolean(force)
             || remote.updatedAt > syncLastRemoteUpdatedAt
             || remoteSerialized !== syncLastRemoteSerialized;
@@ -2008,12 +2056,30 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         if (remoteSerialized === localSerialized) {
             return false;
         }
+        const saveStartedAt = nowPerfMs();
         saveTargets(remote.targets, { skipSync: true });
+        recordSlowDebugStage('sync.apply', 'saveTargetsFromRemote', saveStartedAt, {
+            targetCount: Object.keys(remote.targets).length
+        });
+        const iconsStartedAt = nowPerfMs();
         refreshTargetIcons();
+        recordSlowDebugStage('sync.apply', 'refreshTargetIconsFromRemoteTargets', iconsStartedAt, {
+            targetCount: Object.keys(remote.targets).length
+        });
+        const panelStartedAt = nowPerfMs();
         updateTargetPanel();
+        recordSlowDebugStage('sync.apply', 'updateTargetPanelFromRemoteTargets', panelStartedAt, {
+            targetCount: Object.keys(remote.targets).length
+        });
         if (typeof onApplied === 'function') {
             onApplied();
         }
+        recordSlowDebugStage('sync.apply', 'applyRemoteTargets', startedAt, {
+            force: Boolean(force),
+            targetCount: Object.keys(remote.targets).length,
+            remoteBytes: remoteSerialized.length,
+            localBytes: localSerialized.length
+        });
         return true;
     }
 
@@ -2022,6 +2088,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         if (!isSyncEnabled() || !isSyncConfigured()) {
             return Promise.resolve({ ok: false, reason: 'sync_not_configured' });
         }
+        const startedAt = nowPerfMs();
         return requestSyncJson('PUT', {
             editLockCommand: {
                 action: String(action || '').toLowerCase(),
@@ -2033,6 +2100,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
                 now: Date.now()
             }
         }).then((payload) => {
+            const applyStartedAt = nowPerfMs();
             applyRemoteTargetsFromPayload(payload, false, null);
             applyRemoteSharedCoordsFromPayload(payload, false, null);
             updateRemoteEditLockFromPayload(payload);
@@ -2042,6 +2110,16 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
             } else {
                 stopEditLockHeartbeat();
             }
+            recordSlowDebugStage('sync.lock', 'sendEditLockCommand apply', applyStartedAt, {
+                action: String(action || '').toLowerCase(),
+                ok: Boolean(result && result.ok),
+                reason: result && result.reason ? result.reason : ''
+            });
+            recordSlowDebugStage('sync.lock', 'sendEditLockCommand total', startedAt, {
+                action: String(action || '').toLowerCase(),
+                ok: Boolean(result && result.ok),
+                reason: result && result.reason ? result.reason : ''
+            });
             return result;
         }).catch((err) => {
             if (!opts.silent) {
@@ -2440,13 +2518,14 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
         });
         syncPullInFlight = true;
         requestSyncJson('GET').then((payload) => {
+            const applyStartedAt = nowPerfMs();
             if (resetInProgress || !isSyncEnabled()) {
                 return;
             }
-            applyRemoteTargetsFromPayload(payload, force, () => {
+            const appliedTargets = applyRemoteTargetsFromPayload(payload, force, () => {
                 setStatus('Sync: objetivos actualizados');
             });
-            applyRemoteSharedCoordsFromPayload(payload, force, () => {
+            const appliedCoords = applyRemoteSharedCoordsFromPayload(payload, force, () => {
                 const targetSelect = document.getElementById(TARGET_SELECT_ID);
                 if (targetSelect && targetSelect.value) {
                     showCoordsForPlayer(targetSelect.value);
@@ -2459,6 +2538,13 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
                 stopEditLockHeartbeat();
             }
             applyRemoteControlCommand(payload);
+            recordSlowDebugStage('sync.pull', 'pull apply payload', applyStartedAt, {
+                force: Boolean(force),
+                appliedTargets: appliedTargets,
+                appliedCoords: appliedCoords,
+                hasLock: Boolean(payload && payload.editLock),
+                hasControl: Boolean(payload && payload.control)
+            });
         }).catch((err) => {
             console.warn('[PTRE sync] pull failed:', err);
             recordDebugEntry('sync.pull', err && err.message ? err.message : 'pull failed', {
@@ -2589,6 +2675,7 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
     }
 
     function refreshTargetIcons() {
+        const startedAt = nowPerfMs();
         const targets = loadTargets();
         const icons = document.querySelectorAll('.' + ICON_CLASS);
         icons.forEach((icon) => {
@@ -2602,6 +2689,10 @@ document.getElementById('copyBtn').addEventListener('click', async () => {
                 icon.classList.remove(ICON_TARGET_CLASS);
             }
             icon.title = canEditSharedTargets() ? 'Marcar objetivo' : 'Objetivos bloqueados';
+        });
+        recordSlowDebugStage('sync.apply', 'refreshTargetIcons', startedAt, {
+            iconCount: icons.length,
+            targetCount: Object.keys(targets).length
         });
     }
 
