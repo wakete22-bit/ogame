@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         PTRE Galaxy Local Panel
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.7.41
+// @version      0.7.41.1
 // @description  Local panel with targets + activity history (IndexedDB).
 // @match        https://*.ogame.gameforge.com/game/*
 // @match        https://lobby.ogame.gameforge.com/*
 // @run-at       document-end
 // @grant        GM_addStyle
+// @grant        GM_deleteValue
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
@@ -50,6 +51,7 @@
     const EDIT_LOCK_STATUS_ID = 'ptreLocalEditLockStatus';
     const EDIT_LOCK_TAKE_ID = 'ptreLocalEditLockTake';
     const EDIT_LOCK_PASS_ID = 'ptreLocalEditLockPass';
+    const RESET_LOCAL_ID = 'ptreLocalResetLocal';
 
     const DB_NAME = 'ptreLocalActivityDB';
     const DB_VERSION = 3;
@@ -92,6 +94,23 @@
     const HISTORY_BRIDGE_TIMEOUT_MS = 45000;
     const TARGETS_BRIDGE_REQUEST = 'ptreLocalTargetsBridgeRequest';
     const TARGETS_BRIDGE_RESPONSE = 'ptreLocalTargetsBridgeResponse';
+    const RESETTABLE_STORAGE_KEYS = [
+        KEY_TARGETS,
+        KEY_CLEANED,
+        KEY_LAST_TARGET,
+        KEY_SCAN_SPEED,
+        KEY_CONTINUOUS_INTERVAL,
+        KEY_CONTINUOUS_ACTIVE,
+        KEY_SCAN_RESUME_PENDING,
+        KEY_EXECUTE_ON_SLAVE,
+        KEY_LAST_REMOTE_CMD,
+        KEY_REMOTE_SCAN_PLAN,
+        KEY_SYNC_MODE,
+        KEY_SYNC_ENDPOINT,
+        KEY_SYNC_TOKEN,
+        KEY_SYNC_ACTOR_ID,
+        KEY_SYNC_EDITOR_TOKEN
+    ];
 
     const isLobby = location.hostname === 'lobby.ogame.gameforge.com' || /\/lobby/i.test(location.pathname);
     if (isLobby) {
@@ -313,6 +332,7 @@
             <div class="ptreLocalRow">
                 <button id="${EDIT_LOCK_TAKE_ID}" class="ptreLocalButton">Tomar control</button>
                 <button id="${EDIT_LOCK_PASS_ID}" class="ptreLocalButton">Pasar control</button>
+                <button id="${RESET_LOCAL_ID}" class="ptreLocalButton">Reset local</button>
             </div>
             <div class="ptreLocalSection">
                 <div class="ptreLocalSectionTitle">Objetivos</div>
@@ -388,6 +408,13 @@
             editLockPassBtn.dataset.bound = 'true';
             editLockPassBtn.addEventListener('click', () => {
                 passEditControl();
+            });
+        }
+        const resetLocalBtn = document.getElementById(RESET_LOCAL_ID);
+        if (resetLocalBtn && !resetLocalBtn.dataset.bound) {
+            resetLocalBtn.dataset.bound = 'true';
+            resetLocalBtn.addEventListener('click', () => {
+                confirmAndResetLocalState();
             });
         }
         updateSyncButtonLabel();
@@ -1897,6 +1924,102 @@
         startTargetsSync();
     }
 
+    function deleteStoredValue(key) {
+        if (!key) {
+            return;
+        }
+        try {
+            if (typeof GM_deleteValue === 'function') {
+                GM_deleteValue(key);
+                return;
+            }
+        } catch (err) {
+            // fallback below
+        }
+        GM_setValue(key, '');
+    }
+
+    function resetStoredValuesToFreshInstall() {
+        RESETTABLE_STORAGE_KEYS.forEach((key) => {
+            deleteStoredValue(key);
+        });
+    }
+
+    function resetRuntimeStateToFreshInstall() {
+        stopScan('', { keepResumePending: false, keepRemotePlan: false });
+        stopTargetsSync();
+        lastGalaxy = null;
+        lastSystem = null;
+        scanQueue = [];
+        scanIndex = 0;
+        scanPending = false;
+        scanPendingSince = 0;
+        scanDelayMs = 1000;
+        continuousIntervalMs = 60000;
+        resumeScanPending = false;
+        resumeContinuousDone = false;
+        reloadScheduled = false;
+        executeOnSlave = false;
+        remoteScanPlan = null;
+        lastRemoteCmdId = '';
+        syncMode = DEFAULT_SYNC_MODE;
+        syncEndpoint = DEFAULT_SYNC_ENDPOINT;
+        syncToken = DEFAULT_SYNC_TOKEN;
+        syncActorId = '';
+        syncEditorToken = '';
+        syncRemoteEditLock = null;
+        syncEditLockClaimInFlight = false;
+        syncEditLockLastClaimAt = 0;
+        setSyncOffline('');
+    }
+
+    function closeLocalDatabaseConnection() {
+        if (!dbPromise) {
+            return Promise.resolve();
+        }
+        return Promise.resolve(dbPromise).then((db) => {
+            if (db && typeof db.close === 'function') {
+                try {
+                    db.close();
+                } catch (err) {
+                    // ignore
+                }
+            }
+        }).catch(() => {
+            // ignore
+        }).then(() => {
+            dbPromise = null;
+        });
+    }
+
+    function confirmAndResetLocalState() {
+        if (!window.confirm('Esto borrara los datos locales de este navegador y dejara el script como recien instalado.')) {
+            return;
+        }
+        const confirmText = window.prompt('Escribe RESET para continuar', '');
+        if (confirmText !== 'RESET') {
+            setStatus('Reset local cancelado');
+            return;
+        }
+        setStatus('Reseteando datos locales...');
+        resetRuntimeStateToFreshInstall();
+        closeLocalDatabaseConnection()
+            .then(() => clearDatabase())
+            .then(() => {
+                resetStoredValuesToFreshInstall();
+                updateSyncButtonLabel();
+                updateTargetPanel();
+                setStatus('Reset local completado. Recargando...');
+                window.setTimeout(() => {
+                    window.location.reload();
+                }, 300);
+            })
+            .catch((err) => {
+                console.warn('[PTRE Local] reset local failed', err);
+                setStatus('Cierra historial u otras pestañas y reintenta');
+            });
+    }
+
     function updateSyncButtonLabel() {
         const btn = document.getElementById(SYNC_CONFIG_ID);
         if (!btn) {
@@ -3008,14 +3131,15 @@
     }
 
     function clearDatabase() {
-        return new Promise((resolve, reject) => {
+        return closeLocalDatabaseConnection().then(() => new Promise((resolve, reject) => {
             const req = indexedDB.deleteDatabase(DB_NAME);
+            req.onblocked = () => reject(new Error('delete blocked'));
             req.onsuccess = () => {
                 dbPromise = null;
                 resolve();
             };
             req.onerror = () => reject(req.error);
-        });
+        }));
     }
 
     function queueObservation(obs) {
