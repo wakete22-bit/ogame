@@ -754,6 +754,15 @@
         return 0;
     }
 
+    function normalizeNameForMatch(text) {
+        return String(text || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
     function mergeCoordLists(localCoords, remoteCoords) {
         const set = new Set();
         normalizeCoordList(localCoords).forEach((coord) => set.add(coord));
@@ -1306,6 +1315,10 @@
         return normalized;
     }
 
+    function hasAnyTargets(targets) {
+        return Object.keys(normalizeTargets(targets)).length > 0;
+    }
+
     function parseRemoteSharedCoordsPayload(payload) {
         if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
             return null;
@@ -1795,11 +1808,19 @@
         if (!isSyncEnabled() || !isSyncConfigured() || syncPullInFlight) {
             return;
         }
+        const localTargetsBeforePull = loadTargets();
         syncPullInFlight = true;
         requestSyncJson('GET').then((payload) => {
-            applyRemoteTargetsFromPayload(payload, force, () => {
-                setStatus('Sync: objetivos actualizados');
-            });
+            const remoteTargetsPayload = parseRemoteTargetsPayload(payload);
+            const remoteHasTargets = Boolean(remoteTargetsPayload && hasAnyTargets(remoteTargetsPayload.targets));
+            const localHasTargets = hasAnyTargets(localTargetsBeforePull);
+            if (remoteHasTargets) {
+                applyRemoteTargetsFromPayload(payload, force, () => {
+                    setStatus('Sync: objetivos actualizados');
+                });
+            } else if (isSyncHost() && localHasTargets) {
+                queueHostTargetsSync(localTargetsBeforePull);
+            }
             applyRemoteSharedCoordsFromPayload(payload, force, () => {
                 const targetSelect = document.getElementById(TARGET_SELECT_ID);
                 if (targetSelect && targetSelect.value) {
@@ -1844,7 +1865,6 @@
         refreshExecuteSlaveToggle();
         renderEditLockStatus();
         pullTargetsFromRemote(true);
-        queueHostTargetsSync(loadTargets());
         if (syncPullTimer) {
             clearInterval(syncPullTimer);
         }
@@ -2594,13 +2614,15 @@
             }
             const playerName = getPlayerName(row, cellPlayerName);
             const playerId = getPlayerId(cellPlayerName);
-            const targetKey = buildTargetKey(playerId, playerName);
+            const storedTargetKey = findStoredTargetKey(targets, playerId, playerName);
+            const targetKey = storedTargetKey || buildTargetKey(playerId, playerName);
             const icon = document.createElement('span');
             icon.className = ICON_CLASS;
             icon.title = canEditSharedTargets() ? 'Marcar objetivo' : 'Objetivos bloqueados';
             icon.dataset.playerName = playerName || 'Desconocido';
+            icon.dataset.playerId = playerId > 0 ? String(playerId) : '';
             icon.dataset.targetKey = targetKey;
-            if (targets[targetKey]) {
+            if (storedTargetKey) {
                 icon.classList.add(ICON_TARGET_CLASS);
             }
             icon.addEventListener('click', (event) => {
@@ -2609,15 +2631,20 @@
                     setStatus(getEditBlockedMessage());
                     return;
                 }
-                const key = icon.dataset.targetKey;
                 const store = loadTargets();
-                if (store[key]) {
-                    delete store[key];
+                const currentPlayerName = String(icon.dataset.playerName || '').trim();
+                const currentPlayerId = Number(icon.dataset.playerId || 0);
+                const existingKey = findStoredTargetKey(store, currentPlayerId, currentPlayerName);
+                const preferredKey = buildTargetKey(currentPlayerId, currentPlayerName);
+                if (existingKey) {
+                    delete store[existingKey];
                     icon.classList.remove(ICON_TARGET_CLASS);
+                    icon.dataset.targetKey = preferredKey;
                     setStatus('Objetivo quitado: ' + icon.dataset.playerName);
                 } else {
-                    store[key] = { name: icon.dataset.playerName };
+                    store[preferredKey] = { name: icon.dataset.playerName };
                     icon.classList.add(ICON_TARGET_CLASS);
+                    icon.dataset.targetKey = preferredKey;
                     setStatus('Objetivo: ' + icon.dataset.playerName);
                 }
                 saveTargets(store);
@@ -2662,6 +2689,30 @@
             return 'id:' + playerId;
         }
         return 'name:' + (playerName || 'unknown');
+    }
+
+    function buildTargetCandidateKeys(playerId, playerName) {
+        const keys = [];
+        const primaryKey = buildTargetKey(playerId, playerName);
+        if (primaryKey) {
+            keys.push(primaryKey);
+        }
+        const nameKey = 'name:' + (playerName || 'unknown');
+        if (nameKey && !keys.includes(nameKey)) {
+            keys.push(nameKey);
+        }
+        return keys;
+    }
+
+    function findStoredTargetKey(targets, playerId, playerName) {
+        const store = normalizeTargets(targets);
+        const candidates = buildTargetCandidateKeys(playerId, playerName);
+        for (const key of candidates) {
+            if (Object.prototype.hasOwnProperty.call(store, key)) {
+                return key;
+            }
+        }
+        return '';
     }
 
     function loadTargets() {
@@ -2983,8 +3034,8 @@
             }
             const playerName = getPlayerName(row, cellPlayerName);
             const playerId = getPlayerId(cellPlayerName);
-            const targetKey = buildTargetKey(playerId, playerName);
-            if (!targets[targetKey]) {
+            const targetKey = findStoredTargetKey(targets, playerId, playerName);
+            if (!targetKey) {
                 continue;
             }
 
@@ -4013,9 +4064,14 @@ th.row-title { z-index: 4; }
 
         await refreshTargetsState();
         const allowedTargetKeys = new Set(Object.keys(targetsState.targets || {}));
-        const players = (await loadPlayers(source)).filter((player) => {
+        const allowedTargetNames = new Set(Object.keys(targetsState.targets || {})
+            .map((key) => normalizeNameForMatch(targetsState.targets[key] && targetsState.targets[key].name))
+            .filter((name) => Boolean(name)));
+        const allPlayers = await loadPlayers(source);
+        const players = allPlayers.filter((player) => {
             const key = String(player && player.playerKey ? player.playerKey : '').trim();
-            return allowedTargetKeys.has(key);
+            const playerName = normalizeNameForMatch(player && player.playerName ? player.playerName : '');
+            return allowedTargetKeys.has(key) || (playerName && allowedTargetNames.has(playerName));
         });
         players.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
 
@@ -4029,6 +4085,20 @@ th.row-title { z-index: 4; }
         });
         if (currentPlayer) {
             playerSelect.value = currentPlayer;
+        }
+        if (players.length === 0) {
+            dateSelect.innerHTML = '<option value="">-- Selecciona --</option>';
+            dateSelect.disabled = true;
+            resetPrimarySelect();
+            if (allowedTargetKeys.size === 0) {
+                setRootMessage(root, 'No hay objetivos cargados en el master para filtrar el historial.');
+            } else if (allPlayers.length === 0) {
+                setRootMessage(root, REMOTE_HISTORY_ONLY
+                    ? 'Hay objetivos, pero el slave no ha subido actividad para ellos o el recorrido se hizo en master.'
+                    : 'Hay objetivos, pero no existe actividad local guardada para ellos.');
+            } else {
+                setRootMessage(root, 'Hay actividad guardada, pero no coincide con las claves actuales de tus objetivos.');
+            }
         }
 
         if (!playerSelect.dataset.bound) {
@@ -4238,7 +4308,7 @@ th.row-title { z-index: 4; }
             });
         }
 
-        if (!playerSelect.value) {
+        if (!playerSelect.value && players.length > 0) {
             root.innerHTML = '';
             resetPrimarySelect();
         }
