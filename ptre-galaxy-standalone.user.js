@@ -981,20 +981,23 @@
     }
 
     function buildRemoteActivitySummarySyncUrl() {
-        let url = appendQueryParam(syncEndpoint, 'historyOnly', '1');
+        let url = buildRemoteActivitySyncUrl();
+        url = appendQueryParam(url, 'historyOnly', '1');
         url = appendQueryParam(url, 'activitySummary', '1');
         return url;
     }
 
     function buildRemoteActivityMetaSyncUrl(playerKey) {
-        let url = appendQueryParam(syncEndpoint, 'historyOnly', '1');
+        let url = buildRemoteActivitySyncUrl();
+        url = appendQueryParam(url, 'historyOnly', '1');
         url = appendQueryParam(url, 'activityMeta', '1');
         url = appendQueryParam(url, 'activityPlayerKey', String(playerKey || '').trim());
         return url;
     }
 
     function buildRemoteActivityPlayerSyncUrl(playerKey, startTs, endTs, limit) {
-        let url = appendQueryParam(syncEndpoint, 'historyOnly', '1');
+        let url = buildRemoteActivitySyncUrl();
+        url = appendQueryParam(url, 'historyOnly', '1');
         url = appendQueryParam(url, 'activityPlayerKey', String(playerKey || '').trim());
         if (Number.isFinite(startTs) && startTs > 0) {
             url = appendQueryParam(url, 'activityStartTs', String(Math.floor(startTs)));
@@ -3558,6 +3561,23 @@ th.row-title { z-index: 4; }
         }
         const raw = payload.activityMeta;
         if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+            const dataset = normalizeRemoteDataset(payload);
+            const dates = new Set();
+            const coords = new Set();
+            dataset.buckets.forEach((rec) => {
+                if (!rec || rec.playerKey !== key) {
+                    return;
+                }
+                if (Number.isFinite(rec.bucketTs) && rec.bucketTs > 0) {
+                    dates.add(dateKey(rec.bucketTs));
+                }
+                const coord = String(rec.coords || '').trim();
+                if (/^\d+:\d+:\d+$/.test(coord)) {
+                    coords.add(coord);
+                }
+            });
+            meta.dates = Array.from(dates).sort();
+            meta.coords = Array.from(coords).sort(compareCoords);
             return meta;
         }
         const rawDates = Array.isArray(raw.dates) ? raw.dates : [];
