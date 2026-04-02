@@ -1153,10 +1153,6 @@
             };
 
             if (isHistoryReq) {
-                if (!isSyncHost()) {
-                    reply(null, 'modo host requerido');
-                    return;
-                }
                 if (!isSyncConfigured()) {
                     reply(null, 'sync no configurado');
                     return;
@@ -1241,10 +1237,6 @@
                 return;
             }
             if (action === 'clearhistoryplayer') {
-                if (!isSyncHost()) {
-                    reply(null, 'modo host requerido');
-                    return;
-                }
                 if (!isSyncConfigured()) {
                     reply(null, 'sync no configurado');
                     return;
@@ -3274,7 +3266,7 @@ th.row-title { z-index: 4; }
     const STORE_BUCKETS = ${JSON.stringify(STORE_BUCKETS)};
     const BUCKET_MS = ${BUCKET_MS};
     const RANGE_HOURS = ${DEFAULT_RANGE_HOURS};
-    const REMOTE_HISTORY_ONLY = ${JSON.stringify(isSyncHost())};
+    const REMOTE_HISTORY_ONLY = ${JSON.stringify(isSyncConfigured())};
     const HISTORY_BRIDGE_REQUEST = ${JSON.stringify(HISTORY_BRIDGE_REQUEST)};
     const HISTORY_BRIDGE_RESPONSE = ${JSON.stringify(HISTORY_BRIDGE_RESPONSE)};
     const TARGETS_BRIDGE_REQUEST = ${JSON.stringify(TARGETS_BRIDGE_REQUEST)};
@@ -3971,7 +3963,7 @@ th.row-title { z-index: 4; }
         const meta = document.querySelector('.meta');
         if (meta) {
             meta.textContent = REMOTE_HISTORY_ONLY
-                ? 'Fuente: historial remoto del slave. Pulsa Actualizar para recargar.'
+                ? 'Fuente: historial remoto sincronizado. Pulsa Actualizar para recargar.'
                 : 'Selecciona jugador y fecha.';
         }
 
