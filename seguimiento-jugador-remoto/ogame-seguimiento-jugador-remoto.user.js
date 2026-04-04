@@ -175,8 +175,10 @@
         return {
             active: false,
             planId: '',
+            planLabel: '',
             playerKey: '',
             playerName: '',
+            steps: [],
             queue: [],
             coordSet: new Set(),
             cycleIntervalMs: DEFAULT_CYCLE_INTERVAL_MS,
@@ -773,7 +775,7 @@
             <div class="otrRow">
                 <div class="otrBox">
                     <div class="otrMeta">Slave: ${escapeHtml(clientId)}</div>
-                    <div class="otrMeta">Plan local: ${slaveRuntime.active ? escapeHtml(slaveRuntime.playerName || slaveRuntime.playerKey) : 'ninguno'}</div>
+                    <div class="otrMeta">Plan local: ${slaveRuntime.active ? escapeHtml(slaveRuntime.planLabel || slaveRuntime.playerName || slaveRuntime.playerKey) : 'ninguno'}</div>
                     <div class="otrMeta">Estado local: ${escapeHtml(formatLocalSlaveStatus())}</div>
                 </div>
             </div>
@@ -1031,7 +1033,7 @@
             playerKey: slaveRuntime.playerKey,
             currentCoord: slaveRuntime.currentCoord,
             progressIndex: slaveRuntime.active ? slaveRuntime.index : 0,
-            progressTotal: slaveRuntime.active ? slaveRuntime.queue.length : 0,
+            progressTotal: slaveRuntime.active ? slaveRuntime.steps.length : 0,
             activePlanId: slaveRuntime.planId,
             lastError: slaveRuntime.lastError
         };
@@ -1051,6 +1053,28 @@
             return 'waiting_galaxy';
         }
         return 'running';
+    }
+
+    function normalizeSlavePlanSteps(values) {
+        if (!Array.isArray(values)) {
+            return [];
+        }
+        return values.map((item) => {
+            if (!item || typeof item !== 'object') {
+                return null;
+            }
+            const coord = normalizeCoord(item.coord);
+            const playerKey = normalizeText(item.playerKey);
+            if (!coord || !playerKey) {
+                return null;
+            }
+            return {
+                coord: coord,
+                playerKey: playerKey,
+                playerId: positiveNumber(item.playerId, 0),
+                playerName: normalizeText(item.playerName || playerKey) || playerKey
+            };
+        }).filter(Boolean);
     }
 
     function applyStatePayload(payload) {
@@ -1644,8 +1668,8 @@
         if (!isMaster()) {
             return;
         }
-        if (!selectedTargetKey) {
-            window.alert('Selecciona un objetivo.');
+        if (!getTargetKeys().length) {
+            window.alert('No hay objetivos.');
             return;
         }
         if (!isConfigured()) {
@@ -1660,7 +1684,7 @@
                 hopDelayMs: hopDelayMs
             });
             await refreshMasterState();
-            setPanelStatus('Escaneo enviado al slave');
+            setPanelStatus('Escaneo de todos los objetivos enviado al slave');
         } catch (error) {
             setPanelStatus('Error iniciando escaneo: ' + error.message);
         }
@@ -1704,19 +1728,21 @@
         slaveRuntime = createEmptySlaveRuntime();
         slaveRuntime.active = true;
         slaveRuntime.planId = normalizeText(plan.planId);
-        slaveRuntime.playerKey = normalizeText(plan.playerKey);
-        slaveRuntime.playerName = normalizeText(plan.playerName || slaveRuntime.playerKey) || slaveRuntime.playerKey;
-        slaveRuntime.queue = Array.isArray(plan.queue) ? plan.queue.map(normalizeCoord).filter(Boolean) : [];
+        slaveRuntime.planLabel = normalizeText(plan.playerName || plan.playerKey) || normalizeText(plan.planId);
+        slaveRuntime.steps = normalizeSlavePlanSteps(plan.steps || []);
+        slaveRuntime.queue = slaveRuntime.steps.map((step) => step.coord);
         slaveRuntime.coordSet = new Set(Array.isArray(plan.coords) ? plan.coords.map(normalizeCoord).filter(Boolean) : []);
         slaveRuntime.cycleIntervalMs = clampCycleInterval(Number(plan.cycleIntervalMs || DEFAULT_CYCLE_INTERVAL_MS));
         slaveRuntime.hopDelayMs = clampHopDelay(Number(plan.hopDelayMs || DEFAULT_HOP_DELAY_MS));
         slaveRuntime.index = 0;
         slaveRuntime.currentCoord = '';
+        slaveRuntime.playerKey = '';
+        slaveRuntime.playerName = '';
         slaveRuntime.waitingLoad = false;
         slaveRuntime.reporting = false;
         slaveRuntime.cooldown = false;
         slaveRuntime.lastError = '';
-        if (!slaveRuntime.queue.length) {
+        if (!slaveRuntime.steps.length) {
             stopSlaveRuntime('Plan vacio');
             return;
         }
@@ -1770,9 +1796,11 @@
             navigateToGalaxy();
             return;
         }
-        if (slaveRuntime.index >= slaveRuntime.queue.length) {
+        if (slaveRuntime.index >= slaveRuntime.steps.length) {
             slaveRuntime.cooldown = true;
             slaveRuntime.currentCoord = '';
+            slaveRuntime.playerKey = '';
+            slaveRuntime.playerName = '';
             slaveRuntime.cycleTimer = setTimeout(() => {
                 slaveRuntime.cooldown = false;
                 slaveRuntime.index = 0;
@@ -1781,7 +1809,15 @@
             renderPanel();
             return;
         }
-        const coord = slaveRuntime.queue[slaveRuntime.index];
+        const step = slaveRuntime.steps[slaveRuntime.index];
+        if (!step) {
+            slaveRuntime.index += 1;
+            slaveRuntime.stepTimer = setTimeout(runNextSlaveStep, slaveRuntime.hopDelayMs);
+            return;
+        }
+        const coord = step.coord;
+        slaveRuntime.playerKey = step.playerKey;
+        slaveRuntime.playerName = step.playerName;
         slaveRuntime.currentCoord = coord;
         slaveRuntime.waitingLoad = true;
         slaveRuntime.reporting = false;
@@ -1839,7 +1875,7 @@
                 playerKey: slaveRuntime.playerKey,
                 currentCoord: slaveRuntime.currentCoord,
                 progressIndex: slaveRuntime.index + 1,
-                progressTotal: slaveRuntime.queue.length,
+                progressTotal: slaveRuntime.steps.length,
                 activePlanId: slaveRuntime.planId,
                 lastError: slaveRuntime.lastError,
                 observations: observations

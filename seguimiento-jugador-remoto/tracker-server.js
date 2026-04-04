@@ -252,22 +252,71 @@ function normalizePlan(input) {
     }
     const planId = normalizeText(input.planId);
     const playerKey = normalizeText(input.playerKey);
-    if (!planId || !playerKey) {
+    if (!planId) {
         return null;
     }
     const coords = uniqueCoords(input.coords || []);
     const queue = uniqueCoords(input.queue || []);
+    const steps = normalizePlanSteps(input.steps || []);
     return {
         planId: planId,
+        scope: normalizeText(input.scope || 'single') || 'single',
         playerKey: playerKey,
         playerId: positiveNumber(input.playerId, 0),
         playerName: normalizeText(input.playerName || playerKey) || playerKey,
         coords: coords,
         queue: queue,
+        steps: steps.length ? steps : buildFallbackPlanSteps(playerKey, positiveNumber(input.playerId, 0), normalizeText(input.playerName || playerKey) || playerKey, queue),
+        preferredPlayerKey: normalizeText(input.preferredPlayerKey),
+        targetCount: Math.max(0, positiveNumber(input.targetCount, 0)),
         cycleIntervalMs: clampNumber(input.cycleIntervalMs, MIN_CYCLE_INTERVAL_MS, MAX_CYCLE_INTERVAL_MS, MIN_CYCLE_INTERVAL_MS),
         hopDelayMs: clampNumber(input.hopDelayMs, MIN_HOP_DELAY_MS, MAX_HOP_DELAY_MS, 1500),
         issuedAt: positiveNumber(input.issuedAt, nowTs())
     };
+}
+
+function normalizePlanStep(input) {
+    if (!isPlainObject(input)) {
+        return null;
+    }
+    const coord = normalizeCoord(input.coord);
+    const playerKey = normalizeText(input.playerKey);
+    if (!coord || !playerKey) {
+        return null;
+    }
+    return {
+        coord: coord,
+        playerKey: playerKey,
+        playerId: positiveNumber(input.playerId, 0),
+        playerName: normalizeText(input.playerName || playerKey) || playerKey
+    };
+}
+
+function normalizePlanSteps(values) {
+    if (!Array.isArray(values)) {
+        return [];
+    }
+    const normalized = [];
+    values.forEach((item) => {
+        const step = normalizePlanStep(item);
+        if (step) {
+            normalized.push(step);
+        }
+    });
+    return normalized;
+}
+
+function buildFallbackPlanSteps(playerKey, playerId, playerName, queue) {
+    const key = normalizeText(playerKey);
+    if (!key) {
+        return [];
+    }
+    return uniqueCoords(queue).map((coord) => ({
+        coord: coord,
+        playerKey: key,
+        playerId: positiveNumber(playerId, 0),
+        playerName: normalizeText(playerName || key) || key
+    }));
 }
 
 function normalizeState(input) {
@@ -408,6 +457,71 @@ function buildQueueFromCoords(coords) {
     return Array.from(systems.values()).sort(compareCoords);
 }
 
+function buildTargetListForPlan(targetMap, preferredPlayerKey) {
+    const preferredKey = normalizeText(preferredPlayerKey);
+    const list = Object.keys(targetMap || {}).map((playerKey) => targetMap[playerKey]).filter(Boolean)
+        .map((target) => normalizeTarget(target, target.playerKey))
+        .filter((target) => target && Array.isArray(target.coords) && target.coords.length);
+
+    list.sort((left, right) => {
+        if (preferredKey) {
+            if (left.playerKey === preferredKey && right.playerKey !== preferredKey) {
+                return -1;
+            }
+            if (right.playerKey === preferredKey && left.playerKey !== preferredKey) {
+                return 1;
+            }
+        }
+        return String(left.playerName || left.playerKey).localeCompare(String(right.playerName || right.playerKey), 'es', { sensitivity: 'base' });
+    });
+
+    return list;
+}
+
+function buildPlanFromTargets(targetMap, cycleIntervalMs, hopDelayMs, preferredPlayerKey) {
+    const targets = buildTargetListForPlan(targetMap, preferredPlayerKey);
+    if (!targets.length) {
+        throw new Error('no hay objetivos con coordenadas');
+    }
+
+    const steps = [];
+    const allCoords = [];
+    const queueSummary = [];
+    targets.forEach((target) => {
+        const queue = buildQueueFromCoords(target.coords);
+        queue.forEach((coord) => {
+            steps.push({
+                coord: coord,
+                playerKey: target.playerKey,
+                playerId: positiveNumber(target.playerId, 0),
+                playerName: normalizeText(target.playerName || target.playerKey) || target.playerKey
+            });
+        });
+        allCoords.push(...target.coords);
+        queueSummary.push(...queue);
+    });
+
+    if (!steps.length) {
+        throw new Error('no hay objetivos con coordenadas');
+    }
+
+    return {
+        planId: randomId('plan'),
+        scope: 'all',
+        playerKey: 'all-targets',
+        playerId: 0,
+        playerName: 'Todos los objetivos (' + String(targets.length) + ')',
+        coords: uniqueCoords(allCoords),
+        queue: uniqueCoords(queueSummary),
+        steps: steps,
+        preferredPlayerKey: normalizeText(preferredPlayerKey),
+        targetCount: targets.length,
+        cycleIntervalMs: clampNumber(cycleIntervalMs, MIN_CYCLE_INTERVAL_MS, MAX_CYCLE_INTERVAL_MS, MIN_CYCLE_INTERVAL_MS),
+        hopDelayMs: clampNumber(hopDelayMs, MIN_HOP_DELAY_MS, MAX_HOP_DELAY_MS, 1500),
+        issuedAt: nowTs()
+    };
+}
+
 function buildPlanFromTarget(target, cycleIntervalMs, hopDelayMs) {
     const queue = buildQueueFromCoords(target.coords);
     if (!queue.length) {
@@ -420,6 +534,9 @@ function buildPlanFromTarget(target, cycleIntervalMs, hopDelayMs) {
         playerName: normalizeText(target.playerName || target.playerKey) || target.playerKey,
         coords: uniqueCoords(target.coords),
         queue: queue,
+        steps: buildFallbackPlanSteps(target.playerKey, positiveNumber(target.playerId, 0), normalizeText(target.playerName || target.playerKey) || target.playerKey, queue),
+        preferredPlayerKey: target.playerKey,
+        targetCount: 1,
         cycleIntervalMs: clampNumber(cycleIntervalMs, MIN_CYCLE_INTERVAL_MS, MAX_CYCLE_INTERVAL_MS, MIN_CYCLE_INTERVAL_MS),
         hopDelayMs: clampNumber(hopDelayMs, MIN_HOP_DELAY_MS, MAX_HOP_DELAY_MS, 1500),
         issuedAt: nowTs()
@@ -437,7 +554,23 @@ function getTargetOrThrow(playerKeyRaw) {
 
 function rebuildPlanIfNeeded(playerKey) {
     const currentPlan = state.runner.currentPlan;
-    if (!currentPlan || currentPlan.playerKey !== playerKey) {
+    if (!currentPlan) {
+        return;
+    }
+    if (currentPlan.scope === 'all') {
+        try {
+            state.runner.currentPlan = buildPlanFromTargets(
+                state.targets,
+                currentPlan.cycleIntervalMs,
+                currentPlan.hopDelayMs,
+                currentPlan.preferredPlayerKey
+            );
+        } catch (error) {
+            state.runner.currentPlan = null;
+        }
+        return;
+    }
+    if (currentPlan.playerKey !== playerKey) {
         return;
     }
     const target = state.targets[playerKey];
@@ -509,11 +642,24 @@ function replaceTargets(payload) {
     state.targets = nextTargets;
     if (state.runner.currentPlan) {
         const currentPlan = state.runner.currentPlan;
-        const target = state.targets[currentPlan.playerKey];
-        if (!target || !target.coords.length) {
-            state.runner.currentPlan = null;
+        if (currentPlan.scope === 'all') {
+            try {
+                state.runner.currentPlan = buildPlanFromTargets(
+                    state.targets,
+                    currentPlan.cycleIntervalMs,
+                    currentPlan.hopDelayMs,
+                    currentPlan.preferredPlayerKey
+                );
+            } catch (error) {
+                state.runner.currentPlan = null;
+            }
         } else {
-            state.runner.currentPlan = buildPlanFromTarget(target, currentPlan.cycleIntervalMs, currentPlan.hopDelayMs);
+            const target = state.targets[currentPlan.playerKey];
+            if (!target || !target.coords.length) {
+                state.runner.currentPlan = null;
+            } else {
+                state.runner.currentPlan = buildPlanFromTarget(target, currentPlan.cycleIntervalMs, currentPlan.hopDelayMs);
+            }
         }
     }
 
@@ -528,8 +674,12 @@ function deleteTarget(playerKeyRaw) {
         throw new Error('playerKey requerido');
     }
     delete state.targets[playerKey];
-    if (state.runner.currentPlan && state.runner.currentPlan.playerKey === playerKey) {
-        state.runner.currentPlan = null;
+    if (state.runner.currentPlan) {
+        if (state.runner.currentPlan.scope === 'all') {
+            rebuildPlanIfNeeded(playerKey);
+        } else if (state.runner.currentPlan.playerKey === playerKey) {
+            state.runner.currentPlan = null;
+        }
     }
     markUpdated();
     persistState();
@@ -552,12 +702,8 @@ function addTargetCoord(playerKeyRaw, coordRaw) {
 }
 
 function startRunner(payload) {
-    const playerKey = normalizeText(payload.playerKey);
-    if (!playerKey) {
-        throw new Error('playerKey requerido');
-    }
-    const target = getTargetOrThrow(playerKey);
-    const plan = buildPlanFromTarget(target, payload.cycleIntervalMs, payload.hopDelayMs);
+    const preferredPlayerKey = normalizeText(payload.playerKey);
+    const plan = buildPlanFromTargets(state.targets, payload.cycleIntervalMs, payload.hopDelayMs, preferredPlayerKey);
     state.runner.currentPlan = plan;
     markUpdated();
     persistState();
