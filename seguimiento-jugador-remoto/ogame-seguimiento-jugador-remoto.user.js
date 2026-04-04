@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OGame Seguimiento Jugador Remoto
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.1.0
+// @version      0.1.1
 // @description  Master/slave para capturar coords, escanear remoto y visualizar historial por jugador.
 // @match        https://*.ogame.gameforge.com/game/*
 // @run-at       document-end
@@ -16,7 +16,7 @@
 (function() {
     'use strict';
 
-    const VERSION = '0.1.0';
+    const VERSION = '0.1.1';
     const PANEL_ID = 'otrRemotePanel';
     const MODAL_ID = 'otrRemoteHistoryModal';
     const TOKEN_HEADER = 'x-tracker-token';
@@ -60,6 +60,7 @@
     let cycleIntervalMs = clampCycleInterval(Number(GM_getValue(KEY_CYCLE_INTERVAL, DEFAULT_CYCLE_INTERVAL_MS) || DEFAULT_CYCLE_INTERVAL_MS));
     let hopDelayMs = clampHopDelay(Number(GM_getValue(KEY_HOP_DELAY, DEFAULT_HOP_DELAY_MS) || DEFAULT_HOP_DELAY_MS));
     let panelStatus = '';
+    let syncErrorStatus = '';
     let pollingTimer = null;
     let pollingBusy = false;
     let galaxyHeartbeatTimer = null;
@@ -210,6 +211,10 @@
     padding: 8px 10px;
     background: #10171f;
     border-bottom: 1px solid #05080b;
+}
+#${PANEL_ID} .otrHeadActions {
+    display: flex;
+    gap: 6px;
 }
 #${PANEL_ID} .otrTitle {
     font-weight: bold;
@@ -450,6 +455,18 @@
         renderPanel();
     }
 
+    function setSyncErrorStatus(message) {
+        syncErrorStatus = normalizeText(message);
+        renderPanel();
+    }
+
+    function clearSyncErrorStatus() {
+        if (!syncErrorStatus) {
+            return;
+        }
+        syncErrorStatus = '';
+    }
+
     function getTargetKeys() {
         const targets = remoteState.targets && typeof remoteState.targets === 'object' ? remoteState.targets : {};
         return Object.keys(targets).sort((left, right) => {
@@ -515,7 +532,7 @@
         const target = getSelectedTarget();
         const currentPlan = remoteState.runner && remoteState.runner.currentPlan ? remoteState.runner.currentPlan : null;
         const slaveStatus = remoteState.runner && remoteState.runner.slaveStatus ? remoteState.runner.slaveStatus : createEmptyRemoteState().runner.slaveStatus;
-        const statusLine = panelStatus || (isMaster()
+        const statusLine = syncErrorStatus || panelStatus || (isMaster()
             ? 'Master listo'
             : isSlave()
                 ? (slaveRuntime.active ? 'Slave ejecutando' : 'Slave listo')
@@ -575,7 +592,10 @@
         panel.innerHTML = `
             <div class="otrHead">
                 <div class="otrTitle">Seguimiento Remoto</div>
-                <button id="otrConfigBtn">Sync...</button>
+                <div class="otrHeadActions">
+                    <button id="otrProbeBtn">Probar</button>
+                    <button id="otrConfigBtn">Sync...</button>
+                </div>
             </div>
             <div class="otrBody">
                 <div class="otrRow otrStatus">v${VERSION} | ${escapeHtml(statusLine)}</div>
@@ -613,6 +633,11 @@
     }
 
     function bindPanelEvents() {
+        const probeBtn = document.getElementById('otrProbeBtn');
+        if (probeBtn) {
+            probeBtn.onclick = runSyncProbe;
+        }
+
         const configBtn = document.getElementById('otrConfigBtn');
         if (configBtn) {
             configBtn.onclick = configureSync;
@@ -703,6 +728,30 @@
         restartPolling();
     }
 
+    async function runSyncProbe() {
+        if (!isConfigured()) {
+            setPanelStatus('Configura sync antes');
+            return;
+        }
+        clearSyncErrorStatus();
+        setPanelStatus('Probando sync...');
+        try {
+            const health = await requestJson('GET', '/health');
+            try {
+                await requestJson('GET', '/state');
+                clearSyncErrorStatus();
+                setPanelStatus(
+                    'Probe OK | base ' + normalizeText(health && health.apiBase) +
+                    ' | token servidor ' + ((health && health.tokenEnabled) ? 'on' : 'off')
+                );
+            } catch (error) {
+                setPanelStatus('Health OK pero /state falla: ' + error.message);
+            }
+        } catch (error) {
+            setPanelStatus('Probe sync: ' + error.message);
+        }
+    }
+
     function normalizeEndpoint(value) {
         return normalizeText(value).replace(/\/+$/, '');
     }
@@ -712,6 +761,7 @@
             clearInterval(pollingTimer);
             pollingTimer = null;
         }
+        clearSyncErrorStatus();
 
         if (isMaster() && isConfigured()) {
             refreshMasterState().catch(() => {});
@@ -741,12 +791,13 @@
         try {
             const payload = await requestJson('GET', '/state');
             applyStatePayload(payload);
+            clearSyncErrorStatus();
             if (isGalaxyPage()) {
                 refreshGalaxyIcons();
             }
             renderPanel();
         } catch (error) {
-            setPanelStatus('Error master sync: ' + error.message);
+            setSyncErrorStatus('Error master sync: ' + error.message);
         } finally {
             pollingBusy = false;
         }
@@ -765,10 +816,11 @@
                 targets: payload.targets || {},
                 runner: payload.runner || {}
             });
+            clearSyncErrorStatus();
             handleSlavePlan(payload.plan || null);
             renderPanel();
         } catch (error) {
-            setPanelStatus('Error slave sync: ' + error.message);
+            setSyncErrorStatus('Error slave sync: ' + error.message);
         } finally {
             pollingBusy = false;
         }
@@ -861,15 +913,20 @@
                     }
                     resolve(parsed);
                 },
-                onerror: () => reject(new Error('fallo de red')),
-                ontimeout: () => reject(new Error('timeout'))
+                onerror: (response) => reject(new Error(buildNetworkError('fallo de red', url, response))),
+                ontimeout: (response) => reject(new Error(buildNetworkError('timeout', url, response)))
             });
         });
     }
 
     function buildUrl(path, queryParams) {
         const url = syncEndpoint + path;
-        const parsed = new URL(url);
+        let parsed;
+        try {
+            parsed = new URL(url);
+        } catch (error) {
+            throw new Error('endpoint invalido: ' + syncEndpoint);
+        }
         if (queryParams && typeof queryParams === 'object') {
             Object.keys(queryParams).forEach((key) => {
                 const value = queryParams[key];
@@ -880,6 +937,65 @@
             });
         }
         return parsed.toString();
+    }
+
+    function buildNetworkError(prefix, requestUrl, response) {
+        const parts = [prefix + ' hacia ' + requestUrl];
+        const details = [];
+        const status = response && Number(response.status);
+        const readyState = response && Number(response.readyState);
+        const statusText = normalizeText(response && response.statusText);
+        const finalUrl = normalizeText(response && response.finalUrl);
+
+        if (Number.isFinite(status) && status > 0) {
+            details.push('status ' + String(status));
+        }
+        if (statusText) {
+            details.push(statusText);
+        }
+        if (Number.isFinite(readyState) && readyState >= 0) {
+            details.push('readyState ' + String(readyState));
+        }
+        if (finalUrl && finalUrl !== requestUrl) {
+            details.push('finalUrl ' + finalUrl);
+        }
+        if (details.length) {
+            parts.push('(' + details.join(' | ') + ')');
+        }
+
+        const hints = buildNetworkHints(requestUrl);
+        if (hints.length) {
+            parts.push(hints.join(' | '));
+        }
+        return parts.join(' | ');
+    }
+
+    function buildNetworkHints(requestUrl) {
+        let parsed;
+        try {
+            parsed = new URL(requestUrl);
+        } catch (error) {
+            return [];
+        }
+
+        const hints = [];
+        const hostname = normalizeText(parsed.hostname).toLowerCase();
+        const pathName = normalizeText(parsed.pathname);
+
+        if (hostname === '0.0.0.0') {
+            hints.push('0.0.0.0 no sirve como destino del navegador; usa la IP o dominio real de la VPS');
+        }
+        if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1') {
+            hints.push('localhost apunta a la maquina del navegador; solo vale si el tracker corre ahi');
+        }
+        if (location.protocol === 'https:' && parsed.protocol === 'http:') {
+            hints.push('pagina https contra endpoint http; revisa bloqueo por mixed content o proxy');
+        }
+        if (!pathName || pathName === '/') {
+            hints.push('revisa la base API; normalmente el endpoint acaba en /tracker');
+        }
+
+        return hints;
     }
 
     function startGalaxyHeartbeat() {
