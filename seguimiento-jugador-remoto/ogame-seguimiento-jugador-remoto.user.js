@@ -1816,12 +1816,19 @@
             return;
         }
         const coord = step.coord;
+        const coordParts = coord.split(':');
         slaveRuntime.playerKey = step.playerKey;
         slaveRuntime.playerName = step.playerName;
         slaveRuntime.currentCoord = coord;
         slaveRuntime.waitingLoad = true;
         slaveRuntime.reporting = false;
         slaveRuntime.cooldown = false;
+        const currentSystem = readCurrentSystem();
+        if (currentSystem && coordParts.length === 3 && currentSystem.galaxy === coordParts[0] && currentSystem.system === coordParts[1]) {
+            maybeProcessSlaveStep().catch(() => {});
+            renderPanel();
+            return;
+        }
         const moved = goToCoord(coord);
         if (!moved) {
             slaveRuntime.lastError = 'No se pudo navegar a ' + coord;
@@ -1895,6 +1902,7 @@
         if (!currentSystem) {
             return [];
         }
+        const targets = remoteState.targets && typeof remoteState.targets === 'object' ? remoteState.targets : {};
         const observations = [];
         for (let pos = 1; pos <= 15; pos += 1) {
             const row = document.getElementById('galaxyRow' + pos);
@@ -1911,16 +1919,17 @@
             }
             const playerName = getPlayerName(row, cellPlayerName);
             const playerId = getPlayerId(cellPlayerName);
-            const rowTargetKey = findTargetKey(remoteState.targets, playerId, playerName) || buildTargetKey(playerId, playerName);
-            if (rowTargetKey !== slaveRuntime.playerKey) {
+            const rowTargetKey = findTargetKey(targets, playerId, playerName);
+            if (!rowTargetKey) {
                 continue;
             }
+            const target = targets[rowTargetKey] || null;
             const coord = normalizeCoord(currentSystem.galaxy + ':' + currentSystem.system + ':' + pos);
             const scannedAt = Date.now();
             observations.push({
-                playerKey: slaveRuntime.playerKey,
-                playerId: playerId,
-                playerName: playerName || slaveRuntime.playerName,
+                playerKey: rowTargetKey,
+                playerId: positiveNumber(playerId, positiveNumber(target && target.playerId, 0)),
+                playerName: normalizeText((target && target.playerName) || playerName || rowTargetKey) || rowTargetKey,
                 coord: coord,
                 scannedAt: scannedAt,
                 bucketTs: floorToBucket(scannedAt),
