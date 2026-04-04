@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OGame Seguimiento Jugador Remoto
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.1.2
+// @version      0.1.3
 // @description  Master/slave para capturar coords, escanear remoto y visualizar historial por jugador.
 // @match        https://*.ogame.gameforge.com/game/*
 // @run-at       document-end
@@ -16,7 +16,7 @@
 (function() {
     'use strict';
 
-    const VERSION = '0.1.2';
+    const VERSION = '0.1.3';
     const PANEL_ID = 'otrRemotePanel';
     const MODAL_ID = 'otrRemoteHistoryModal';
     const TOKEN_HEADER = 'x-tracker-token';
@@ -30,11 +30,14 @@
     const DEFAULT_TOKEN = '';
     const DEFAULT_CYCLE_INTERVAL_MS = 5 * 60 * 1000;
     const DEFAULT_HOP_DELAY_MS = 2000;
+    const MASTER_TARGET_SYNC_DEBOUNCE_MS = 600;
 
     const KEY_MODE = 'otrRemoteMode';
     const KEY_ENDPOINT = 'otrRemoteEndpoint';
     const KEY_TOKEN = 'otrRemoteToken';
     const KEY_CLIENT_ID = 'otrRemoteClientId';
+    const KEY_LOCAL_TARGETS = 'otrRemoteLocalTargets';
+    const KEY_TARGETS_BOOTSTRAPPED = 'otrRemoteTargetsBootstrapped';
     const KEY_SELECTED_TARGET = 'otrRemoteSelectedTarget';
     const KEY_CAPTURE_TARGET = 'otrRemoteCaptureTarget';
     const KEY_CYCLE_INTERVAL = 'otrRemoteCycleInterval';
@@ -70,6 +73,11 @@
     let captureBusy = false;
     let slaveRuntime = createEmptySlaveRuntime();
     let remoteState = createEmptyRemoteState();
+    let localTargets = loadLocalTargets();
+    let localTargetsBootstrapped = Boolean(GM_getValue(KEY_TARGETS_BOOTSTRAPPED, false));
+    let masterTargetsSyncTimer = null;
+    let masterTargetsSyncPromise = null;
+    let masterTargetsSyncDirty = false;
 
     let historyState = {
         open: false,
@@ -468,17 +476,197 @@
         syncErrorStatus = '';
     }
 
-    function getTargetKeys() {
-        const targets = remoteState.targets && typeof remoteState.targets === 'object' ? remoteState.targets : {};
-        return Object.keys(targets).sort((left, right) => {
-            const leftName = normalizeText(targets[left] && targets[left].playerName ? targets[left].playerName : left).toLowerCase();
-            const rightName = normalizeText(targets[right] && targets[right].playerName ? targets[right].playerName : right).toLowerCase();
+    function normalizeTargetRecord(input, fallbackKey) {
+        if ((!input || typeof input !== 'object') && !fallbackKey) {
+            return null;
+        }
+        const playerKey = normalizeText((input && input.playerKey) || fallbackKey);
+        if (!playerKey) {
+            return null;
+        }
+        const now = Date.now();
+        const coords = Array.isArray(input && input.coords)
+            ? Array.from(new Set(input.coords.map(normalizeCoord).filter(Boolean))).sort(compareCoords)
+            : [];
+        return {
+            playerKey: playerKey,
+            playerId: positiveNumber(input && input.playerId, 0),
+            playerName: normalizeText((input && input.playerName) || playerKey) || playerKey,
+            coords: coords,
+            addedAt: positiveNumber(input && input.addedAt, now),
+            updatedAt: positiveNumber(input && input.updatedAt, now)
+        };
+    }
+
+    function normalizeTargetMap(input) {
+        const normalized = {};
+        if (!input || typeof input !== 'object') {
+            return normalized;
+        }
+        Object.keys(input).forEach((playerKey) => {
+            const target = normalizeTargetRecord(input[playerKey], playerKey);
+            if (target) {
+                normalized[target.playerKey] = target;
+            }
+        });
+        return normalized;
+    }
+
+    function loadLocalTargets() {
+        const raw = GM_getValue(KEY_LOCAL_TARGETS, '{}');
+        try {
+            if (typeof raw === 'string') {
+                return normalizeTargetMap(raw ? JSON.parse(raw) : {});
+            }
+            return normalizeTargetMap(raw);
+        } catch (error) {
+            return {};
+        }
+    }
+
+    function persistLocalTargets() {
+        GM_setValue(KEY_LOCAL_TARGETS, JSON.stringify(localTargets));
+        GM_setValue(KEY_TARGETS_BOOTSTRAPPED, true);
+        localTargetsBootstrapped = true;
+    }
+
+    function getCurrentTargets() {
+        return isMaster() ? localTargets : (remoteState.targets && typeof remoteState.targets === 'object' ? remoteState.targets : {});
+    }
+
+    function getTargetKeysFromMap(targets) {
+        const map = targets && typeof targets === 'object' ? targets : {};
+        return Object.keys(map).sort((left, right) => {
+            const leftName = normalizeText(map[left] && map[left].playerName ? map[left].playerName : left).toLowerCase();
+            const rightName = normalizeText(map[right] && map[right].playerName ? map[right].playerName : right).toLowerCase();
             return leftName.localeCompare(rightName, 'es', { sensitivity: 'base' });
         });
     }
 
+    function sanitizeTargetSelection() {
+        const targets = getCurrentTargets();
+        const keys = getTargetKeysFromMap(targets);
+        if (selectedTargetKey && !targets[selectedTargetKey]) {
+            selectedTargetKey = '';
+            GM_setValue(KEY_SELECTED_TARGET, '');
+        }
+        if (captureTargetKey && !targets[captureTargetKey]) {
+            captureTargetKey = '';
+            GM_setValue(KEY_CAPTURE_TARGET, '');
+        }
+        if (!selectedTargetKey && keys.length && isMaster()) {
+            selectedTargetKey = keys[0];
+            GM_setValue(KEY_SELECTED_TARGET, selectedTargetKey);
+        }
+    }
+
+    function replaceLocalTargets(nextTargets) {
+        localTargets = normalizeTargetMap(nextTargets);
+        persistLocalTargets();
+        sanitizeTargetSelection();
+    }
+
+    function serializeTargets(targets) {
+        const map = normalizeTargetMap(targets);
+        const payload = Object.keys(map).sort().map((playerKey) => {
+            const target = map[playerKey];
+            return {
+                playerKey: playerKey,
+                playerId: positiveNumber(target && target.playerId, 0),
+                playerName: normalizeText(target && target.playerName ? target.playerName : playerKey) || playerKey,
+                coords: Array.isArray(target && target.coords) ? target.coords.map(normalizeCoord).filter(Boolean).sort(compareCoords) : []
+            };
+        });
+        return JSON.stringify(payload);
+    }
+
+    function markLocalTargetsDirty(immediateSync) {
+        masterTargetsSyncDirty = true;
+        if (!isMaster() || !isConfigured()) {
+            return;
+        }
+        queueMasterTargetsSync(immediateSync);
+    }
+
+    function queueMasterTargetsSync(immediateSync) {
+        if (!isMaster() || !isConfigured()) {
+            return;
+        }
+        if (masterTargetsSyncTimer) {
+            clearTimeout(masterTargetsSyncTimer);
+            masterTargetsSyncTimer = null;
+        }
+        masterTargetsSyncTimer = setTimeout(() => {
+            masterTargetsSyncTimer = null;
+            syncMasterTargetsNow().catch(() => {});
+        }, immediateSync ? 0 : MASTER_TARGET_SYNC_DEBOUNCE_MS);
+    }
+
+    async function syncMasterTargetsNow(options) {
+        if (!isMaster() || !isConfigured()) {
+            return;
+        }
+        const settings = options && typeof options === 'object' ? options : {};
+        const localSerialized = serializeTargets(localTargets);
+        const remoteSerialized = serializeTargets(remoteState.targets);
+        if (!settings.force && !masterTargetsSyncDirty && localSerialized === remoteSerialized) {
+            return;
+        }
+        if (masterTargetsSyncTimer) {
+            clearTimeout(masterTargetsSyncTimer);
+            masterTargetsSyncTimer = null;
+        }
+        if (masterTargetsSyncPromise) {
+            return masterTargetsSyncPromise;
+        }
+        masterTargetsSyncPromise = (async () => {
+            try {
+                const payload = await requestJson('POST', '/targets/replace', {
+                    targets: localTargets
+                });
+                if (payload && payload.state) {
+                    applyStatePayload(payload.state);
+                }
+                masterTargetsSyncDirty = false;
+                clearSyncErrorStatus();
+            } catch (error) {
+                masterTargetsSyncDirty = true;
+                if (!settings.silent) {
+                    setSyncErrorStatus('Error master push: ' + error.message);
+                }
+                throw error;
+            } finally {
+                masterTargetsSyncPromise = null;
+            }
+        })();
+        return masterTargetsSyncPromise;
+    }
+
+    function maybeBootstrapLocalTargets(remoteTargets) {
+        if (!isMaster() || localTargetsBootstrapped) {
+            return false;
+        }
+        if (Object.keys(localTargets).length) {
+            GM_setValue(KEY_TARGETS_BOOTSTRAPPED, true);
+            localTargetsBootstrapped = true;
+            return false;
+        }
+        const normalizedRemoteTargets = normalizeTargetMap(remoteTargets);
+        if (!Object.keys(normalizedRemoteTargets).length) {
+            return false;
+        }
+        replaceLocalTargets(normalizedRemoteTargets);
+        setPanelStatus('Objetivos locales importados del servidor');
+        return true;
+    }
+
+    function getTargetKeys() {
+        return getTargetKeysFromMap(getCurrentTargets());
+    }
+
     function getSelectedTarget() {
-        return selectedTargetKey && remoteState.targets ? remoteState.targets[selectedTargetKey] || null : null;
+        const targets = getCurrentTargets();
+        return selectedTargetKey && targets ? targets[selectedTargetKey] || null : null;
     }
 
     function formatSlaveStatus(status) {
@@ -502,13 +690,14 @@
     }
 
     function buildTargetOptions() {
+        const targets = getCurrentTargets();
         const keys = getTargetKeys();
         if (!selectedTargetKey && keys.length) {
             selectedTargetKey = keys[0];
             GM_setValue(KEY_SELECTED_TARGET, selectedTargetKey);
         }
         return ['<option value="">-- Selecciona --</option>'].concat(keys.map((playerKey) => {
-            const target = remoteState.targets[playerKey];
+            const target = targets[playerKey];
             const name = escapeHtml(target && target.playerName ? target.playerName : playerKey);
             const coordsCount = target && Array.isArray(target.coords) ? target.coords.length : 0;
             const selected = playerKey === selectedTargetKey ? ' selected' : '';
@@ -762,6 +951,10 @@
             clearInterval(pollingTimer);
             pollingTimer = null;
         }
+        if (masterTargetsSyncTimer) {
+            clearTimeout(masterTargetsSyncTimer);
+            masterTargetsSyncTimer = null;
+        }
         clearSyncErrorStatus();
 
         if (isMaster() && isConfigured()) {
@@ -792,7 +985,11 @@
         try {
             const payload = await requestJson('GET', '/state');
             applyStatePayload(payload);
+            maybeBootstrapLocalTargets(payload && payload.targets);
             clearSyncErrorStatus();
+            if (masterTargetsSyncDirty || serializeTargets(localTargets) !== serializeTargets(remoteState.targets)) {
+                queueMasterTargetsSync(true);
+            }
             if (isGalaxyPage()) {
                 refreshGalaxyIcons();
             }
@@ -864,20 +1061,7 @@
         remoteState.runner = payload && payload.runner && typeof payload.runner === 'object'
             ? payload.runner
             : createEmptyRemoteState().runner;
-
-        const keys = getTargetKeys();
-        if (selectedTargetKey && !remoteState.targets[selectedTargetKey]) {
-            selectedTargetKey = '';
-            GM_setValue(KEY_SELECTED_TARGET, '');
-        }
-        if (captureTargetKey && !remoteState.targets[captureTargetKey]) {
-            captureTargetKey = '';
-            GM_setValue(KEY_CAPTURE_TARGET, '');
-        }
-        if (!selectedTargetKey && keys.length && isMaster()) {
-            selectedTargetKey = keys[0];
-            GM_setValue(KEY_SELECTED_TARGET, selectedTargetKey);
-        }
+        sanitizeTargetSelection();
     }
 
     async function requestJson(method, path, body, queryParams) {
@@ -1097,7 +1281,7 @@
         if (!isGalaxyPage()) {
             return;
         }
-        const targets = remoteState.targets && typeof remoteState.targets === 'object' ? remoteState.targets : {};
+        const targets = getCurrentTargets();
         for (let pos = 1; pos <= 15; pos += 1) {
             const row = document.getElementById('galaxyRow' + pos);
             if (!row) {
@@ -1140,19 +1324,13 @@
             setPanelStatus('Solo el master puede editar objetivos');
             return;
         }
-        if (!isConfigured()) {
-            setPanelStatus('Configura sync antes');
-            return;
-        }
 
         if (existingKey) {
             const ok = window.confirm('¿Quitar objetivo "' + playerName + '"?');
             if (!ok) {
                 return;
             }
-            await requestJson('POST', '/targets/delete', {
-                playerKey: existingKey
-            });
+            deleteLocalTarget(existingKey);
             if (selectedTargetKey === existingKey) {
                 selectedTargetKey = '';
                 GM_setValue(KEY_SELECTED_TARGET, '');
@@ -1161,20 +1339,29 @@
                 captureTargetKey = '';
                 GM_setValue(KEY_CAPTURE_TARGET, '');
             }
-            await refreshMasterState();
+            sanitizeTargetSelection();
+            markLocalTargetsDirty(true);
+            if (isGalaxyPage()) {
+                refreshGalaxyIcons();
+            }
+            renderPanel();
             setPanelStatus('Objetivo quitado');
             return;
         }
 
         const playerKey = buildTargetKey(playerId, playerName);
-        await requestJson('POST', '/targets/upsert', {
+        upsertLocalTarget({
             playerKey: playerKey,
             playerId: playerId,
             playerName: playerName
         });
         selectedTargetKey = playerKey;
         GM_setValue(KEY_SELECTED_TARGET, selectedTargetKey);
-        await refreshMasterState();
+        markLocalTargetsDirty(true);
+        if (isGalaxyPage()) {
+            refreshGalaxyIcons();
+        }
+        renderPanel();
         setPanelStatus('Objetivo añadido');
     }
 
@@ -1184,6 +1371,40 @@
             return 'id:' + String(id);
         }
         return 'name:' + normalizeNameForMatch(playerName || 'unknown');
+    }
+
+    function upsertLocalTarget(payload) {
+        const normalized = normalizeTargetRecord(payload, payload && payload.playerKey);
+        if (!normalized) {
+            return null;
+        }
+        const existing = localTargets[normalized.playerKey];
+        const mergedCoords = Array.from(new Set([
+            ...((existing && Array.isArray(existing.coords)) ? existing.coords.map(normalizeCoord).filter(Boolean) : []),
+            ...normalized.coords
+        ])).sort(compareCoords);
+        const now = Date.now();
+        localTargets[normalized.playerKey] = {
+            playerKey: normalized.playerKey,
+            playerId: positiveNumber(normalized.playerId, positiveNumber(existing && existing.playerId, 0)),
+            playerName: normalized.playerName || normalizeText(existing && existing.playerName) || normalized.playerKey,
+            coords: mergedCoords,
+            addedAt: positiveNumber(existing && existing.addedAt, now),
+            updatedAt: now
+        };
+        persistLocalTargets();
+        sanitizeTargetSelection();
+        return localTargets[normalized.playerKey];
+    }
+
+    function deleteLocalTarget(playerKey) {
+        const key = normalizeText(playerKey);
+        if (!key || !localTargets[key]) {
+            return;
+        }
+        delete localTargets[key];
+        persistLocalTargets();
+        sanitizeTargetSelection();
     }
 
     function buildTargetCandidateKeys(playerId, playerName) {
@@ -1316,7 +1537,8 @@
     }
 
     function getTargetLabel(playerKey) {
-        const target = remoteState.targets && remoteState.targets[playerKey] ? remoteState.targets[playerKey] : null;
+        const targets = getCurrentTargets();
+        const target = targets && targets[playerKey] ? targets[playerKey] : null;
         return target && target.playerName ? target.playerName : playerKey;
     }
 
@@ -1347,10 +1569,10 @@
     }
 
     async function captureVisibleCoordsIfNeeded() {
-        if (!isMaster() || !captureTargetKey || !isGalaxyPage() || captureBusy || !isConfigured()) {
+        if (!isMaster() || !captureTargetKey || !isGalaxyPage() || captureBusy) {
             return;
         }
-        const target = remoteState.targets && remoteState.targets[captureTargetKey] ? remoteState.targets[captureTargetKey] : null;
+        const target = localTargets && localTargets[captureTargetKey] ? localTargets[captureTargetKey] : null;
         if (!target) {
             return;
         }
@@ -1375,7 +1597,7 @@
             }
             const playerName = getPlayerName(row, cellPlayerName);
             const playerId = getPlayerId(cellPlayerName);
-            const rowTargetKey = findTargetKey(remoteState.targets, playerId, playerName);
+            const rowTargetKey = findTargetKey(localTargets, playerId, playerName);
             if (rowTargetKey !== captureTargetKey) {
                 continue;
             }
@@ -1391,15 +1613,24 @@
         }
         captureBusy = true;
         try {
+            let changed = false;
             for (const coord of coordsToAdd) {
-                const payload = await requestJson('POST', '/targets/coords/add', {
+                const updatedTarget = upsertLocalTarget({
                     playerKey: captureTargetKey,
-                    coord: coord
+                    playerId: positiveNumber(target.playerId, 0),
+                    playerName: target.playerName,
+                    coords: [coord]
                 });
-                if (payload && payload.target) {
-                    remoteState.targets[captureTargetKey] = payload.target;
+                if (updatedTarget) {
+                    changed = true;
                 }
                 setPanelStatus('Coord registrada: ' + coord);
+            }
+            if (changed) {
+                markLocalTargetsDirty(true);
+            }
+            if (isGalaxyPage()) {
+                refreshGalaxyIcons();
             }
             renderPanel();
         } catch (error) {
@@ -1417,7 +1648,12 @@
             window.alert('Selecciona un objetivo.');
             return;
         }
+        if (!isConfigured()) {
+            setPanelStatus('Configura sync antes');
+            return;
+        }
         try {
+            await syncMasterTargetsNow({ force: true });
             await requestJson('POST', '/runner/start', {
                 playerKey: selectedTargetKey,
                 cycleIntervalMs: cycleIntervalMs,

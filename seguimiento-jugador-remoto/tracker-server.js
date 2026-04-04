@@ -483,6 +483,45 @@ function upsertTarget(payload) {
     return state.targets[playerKey];
 }
 
+function replaceTargets(payload) {
+    const rawTargets = isPlainObject(payload) && isPlainObject(payload.targets)
+        ? payload.targets
+        : payload;
+    if (!isPlainObject(rawTargets)) {
+        throw new Error('targets requeridos');
+    }
+
+    const previousTargets = state.targets || {};
+    const now = nowTs();
+    const nextTargets = {};
+
+    Object.keys(rawTargets).forEach((playerKey) => {
+        const normalized = normalizeTarget(rawTargets[playerKey], playerKey);
+        if (!normalized) {
+            return;
+        }
+        const previous = previousTargets[normalized.playerKey] || null;
+        normalized.addedAt = positiveNumber(previous && previous.addedAt, positiveNumber(normalized.addedAt, now));
+        normalized.updatedAt = now;
+        nextTargets[normalized.playerKey] = normalized;
+    });
+
+    state.targets = nextTargets;
+    if (state.runner.currentPlan) {
+        const currentPlan = state.runner.currentPlan;
+        const target = state.targets[currentPlan.playerKey];
+        if (!target || !target.coords.length) {
+            state.runner.currentPlan = null;
+        } else {
+            state.runner.currentPlan = buildPlanFromTarget(target, currentPlan.cycleIntervalMs, currentPlan.hopDelayMs);
+        }
+    }
+
+    markUpdated();
+    persistState();
+    return state.targets;
+}
+
 function deleteTarget(playerKeyRaw) {
     const playerKey = normalizeText(playerKeyRaw);
     if (!playerKey) {
@@ -793,6 +832,12 @@ const server = http.createServer(async (req, res) => {
 
         const rawBody = await readBody(req);
         const body = rawBody ? JSON.parse(rawBody) : {};
+
+        if (reqUrl.pathname === API_BASE + '/targets/replace') {
+            replaceTargets(body || {});
+            sendJson(res, 200, { ok: true, state: buildStatePayload() });
+            return;
+        }
 
         if (reqUrl.pathname === API_BASE + '/targets/upsert') {
             const target = upsertTarget(body || {});
