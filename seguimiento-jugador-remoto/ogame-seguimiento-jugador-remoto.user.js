@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OGame Seguimiento Jugador Remoto
 // @namespace    https://openuserjs.org/users/GeGe_GM
-// @version      0.1.1
+// @version      0.1.2
 // @description  Master/slave para capturar coords, escanear remoto y visualizar historial por jugador.
 // @match        https://*.ogame.gameforge.com/game/*
 // @run-at       document-end
@@ -16,7 +16,7 @@
 (function() {
     'use strict';
 
-    const VERSION = '0.1.1';
+    const VERSION = '0.1.2';
     const PANEL_ID = 'otrRemotePanel';
     const MODAL_ID = 'otrRemoteHistoryModal';
     const TOKEN_HEADER = 'x-tracker-token';
@@ -64,8 +64,9 @@
     let pollingTimer = null;
     let pollingBusy = false;
     let galaxyHeartbeatTimer = null;
-    let lastGalaxyLoadingVisible = null;
-    let galaxyReadyScheduled = false;
+    let galaxyLoadingObserver = null;
+    let galaxyChangeObserver = null;
+    let observedGalaxyLoading = null;
     let captureBusy = false;
     let slaveRuntime = createEmptySlaveRuntime();
     let remoteState = createEmptyRemoteState();
@@ -1003,43 +1004,80 @@
             clearInterval(galaxyHeartbeatTimer);
             galaxyHeartbeatTimer = null;
         }
+        disconnectGalaxyObservers();
+        observedGalaxyLoading = null;
+        ensureGalaxyWatchers();
         galaxyHeartbeatTimer = setInterval(() => {
-            if (!isGalaxyPage()) {
-                lastGalaxyLoadingVisible = null;
-                return;
-            }
-            const loadingVisible = isGalaxyLoadingVisible();
-            if (lastGalaxyLoadingVisible === null) {
-                lastGalaxyLoadingVisible = loadingVisible;
-                if (!loadingVisible) {
-                    scheduleGalaxyReady();
-                }
-                return;
-            }
-            if (lastGalaxyLoadingVisible && !loadingVisible) {
-                scheduleGalaxyReady();
-            }
-            lastGalaxyLoadingVisible = loadingVisible;
+            ensureGalaxyWatchers();
         }, GALAXY_HEARTBEAT_MS);
     }
 
-    function isGalaxyLoadingVisible() {
-        const loading = document.getElementById('galaxyLoading');
-        if (!loading) {
-            return false;
+    function disconnectGalaxyObservers() {
+        if (galaxyLoadingObserver) {
+            galaxyLoadingObserver.disconnect();
+            galaxyLoadingObserver = null;
         }
-        return window.getComputedStyle(loading).display !== 'none';
+        if (galaxyChangeObserver) {
+            galaxyChangeObserver.disconnect();
+            galaxyChangeObserver = null;
+        }
     }
 
-    function scheduleGalaxyReady() {
-        if (galaxyReadyScheduled) {
+    function ensureGalaxyWatchers() {
+        if (!isGalaxyPage()) {
+            disconnectGalaxyObservers();
+            observedGalaxyLoading = null;
             return;
         }
-        galaxyReadyScheduled = true;
-        setTimeout(() => {
-            galaxyReadyScheduled = false;
+
+        const galaxyLoading = document.getElementById('galaxyLoading');
+        if (!galaxyLoading) {
+            return;
+        }
+
+        if (observedGalaxyLoading === galaxyLoading) {
+            return;
+        }
+
+        disconnectGalaxyObservers();
+        observedGalaxyLoading = galaxyLoading;
+        waitForGalaxyToBeLoaded();
+        watchGalaxyChanges();
+    }
+
+    function waitForGalaxyToBeLoaded() {
+        const galaxyLoading = document.getElementById('galaxyLoading');
+        if (!galaxyLoading) {
+            return;
+        }
+        if (window.getComputedStyle(galaxyLoading).display === 'none') {
             onGalaxyReady();
-        }, 100);
+            return;
+        }
+        galaxyLoadingObserver = new MutationObserver((mutations, observer) => {
+            if (window.getComputedStyle(galaxyLoading).display === 'none') {
+                observer.disconnect();
+                galaxyLoadingObserver = null;
+                onGalaxyReady();
+            }
+        });
+        galaxyLoadingObserver.observe(galaxyLoading, { childList: true, attributes: true });
+    }
+
+    function watchGalaxyChanges() {
+        const galaxyLoading = document.getElementById('galaxyLoading');
+        if (!galaxyLoading) {
+            return;
+        }
+        galaxyChangeObserver = new MutationObserver((mutations, observer) => {
+            if (window.getComputedStyle(galaxyLoading).display !== 'none') {
+                observer.disconnect();
+                galaxyChangeObserver = null;
+                waitForGalaxyToBeLoaded();
+                watchGalaxyChanges();
+            }
+        });
+        galaxyChangeObserver.observe(galaxyLoading, { childList: true, attributes: true });
     }
 
     function onGalaxyReady() {
