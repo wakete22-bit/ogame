@@ -1,0 +1,1548 @@
+<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#0f141b">
+    <title>Tracker Master Movil</title>
+    <link rel="manifest" href="./mobile.webmanifest">
+    <style>
+        :root {
+            --bg: #0a0f14;
+            --bg-accent: #152331;
+            --panel: rgba(16, 24, 34, 0.9);
+            --panel-border: rgba(108, 144, 182, 0.24);
+            --panel-strong: #182330;
+            --text: #e6edf3;
+            --muted: #93a4b5;
+            --line: rgba(133, 164, 197, 0.18);
+            --ok: #77d275;
+            --warn: #e2c062;
+            --bad: #f27c7c;
+            --accent: #6fd8c4;
+            --accent-strong: #2d4e5a;
+            --shadow: 0 22px 46px rgba(0, 0, 0, 0.32);
+            --radius: 18px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html, body {
+            margin: 0;
+            min-height: 100%;
+        }
+
+        body {
+            background:
+                radial-gradient(circle at top, rgba(89, 134, 176, 0.16), transparent 34%),
+                radial-gradient(circle at bottom right, rgba(73, 146, 126, 0.12), transparent 28%),
+                linear-gradient(180deg, var(--bg-accent), var(--bg));
+            color: var(--text);
+            font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        button,
+        input,
+        select {
+            font: inherit;
+        }
+
+        button {
+            cursor: pointer;
+        }
+
+        .app-shell {
+            width: min(100%, 720px);
+            margin: 0 auto;
+            padding:
+                calc(16px + env(safe-area-inset-top))
+                14px
+                calc(28px + env(safe-area-inset-bottom));
+        }
+
+        .hero {
+            padding: 22px 6px 10px;
+        }
+
+        .hero-kicker {
+            margin: 0 0 8px;
+            color: var(--accent);
+            font-size: 12px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+        }
+
+        .hero h1 {
+            margin: 0;
+            font-size: clamp(28px, 8vw, 38px);
+            line-height: 1;
+        }
+
+        .hero p {
+            margin: 12px 0 0;
+            max-width: 34rem;
+            color: var(--muted);
+        }
+
+        .stack {
+            display: grid;
+            gap: 14px;
+        }
+
+        .panel {
+            padding: 16px;
+            background: var(--panel);
+            border: 1px solid var(--panel-border);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(10px);
+        }
+
+        .panel-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+
+        .panel-title {
+            margin: 0;
+            font-size: 16px;
+        }
+
+        .panel-subtitle {
+            margin: 0;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .panel-grid {
+            display: grid;
+            gap: 10px;
+        }
+
+        .stats-grid {
+            display: grid;
+            gap: 10px;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .stat {
+            padding: 12px;
+            border-radius: 14px;
+            background: rgba(15, 22, 31, 0.88);
+            border: 1px solid var(--line);
+        }
+
+        .stat-label {
+            display: block;
+            color: var(--muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .stat-value {
+            display: block;
+            margin-top: 4px;
+            font-size: 18px;
+            font-weight: 700;
+        }
+
+        .field-grid {
+            display: grid;
+            gap: 10px;
+        }
+
+        .field-row {
+            display: grid;
+            gap: 10px;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .field label {
+            display: block;
+            margin-bottom: 6px;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .text-input,
+        .select-input {
+            width: 100%;
+            min-height: 46px;
+            padding: 10px 12px;
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            background: rgba(7, 11, 16, 0.68);
+            color: var(--text);
+        }
+
+        .button-row,
+        .compact-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .button {
+            min-height: 44px;
+            padding: 10px 14px;
+            border: 1px solid transparent;
+            border-radius: 12px;
+            color: var(--text);
+            background: #283645;
+        }
+
+        .button:hover {
+            filter: brightness(1.05);
+        }
+
+        .button:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+
+        .button-primary {
+            background: linear-gradient(180deg, #2c8a7b, #20544c);
+        }
+
+        .button-secondary {
+            background: linear-gradient(180deg, #385272, #24364d);
+        }
+
+        .button-danger {
+            background: linear-gradient(180deg, #8f4242, #632d2d);
+        }
+
+        .button-ghost {
+            background: rgba(16, 23, 31, 0.5);
+            border-color: var(--line);
+        }
+
+        .status {
+            display: grid;
+            gap: 6px;
+            padding: 12px;
+            border-radius: 14px;
+            background: rgba(10, 15, 20, 0.76);
+            border: 1px solid var(--line);
+        }
+
+        .status strong {
+            font-size: 14px;
+        }
+
+        .status-ok strong {
+            color: var(--ok);
+        }
+
+        .status-error strong {
+            color: var(--bad);
+        }
+
+        .muted {
+            color: var(--muted);
+        }
+
+        .chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            border-radius: 999px;
+            background: rgba(22, 33, 45, 0.92);
+            border: 1px solid var(--line);
+            color: var(--text);
+            font-size: 13px;
+        }
+
+        .chip button {
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: var(--muted);
+        }
+
+        .target-list,
+        .history-groups {
+            display: grid;
+            gap: 10px;
+        }
+
+        .target-card,
+        .history-card {
+            padding: 14px;
+            border-radius: 14px;
+            background: rgba(13, 19, 27, 0.84);
+            border: 1px solid var(--line);
+        }
+
+        .target-card.selected {
+            border-color: rgba(111, 216, 196, 0.65);
+            box-shadow: inset 0 0 0 1px rgba(111, 216, 196, 0.25);
+        }
+
+        .target-head,
+        .history-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+
+        .target-name,
+        .history-coord {
+            margin: 0;
+            font-size: 16px;
+        }
+
+        .meta-line {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .divider {
+            height: 1px;
+            margin: 12px 0;
+            background: var(--line);
+        }
+
+        .record-list {
+            display: grid;
+            gap: 8px;
+        }
+
+        .record {
+            display: grid;
+            gap: 8px;
+            padding: 10px 12px;
+            border-radius: 12px;
+            background: rgba(18, 27, 38, 0.78);
+            border: 1px solid rgba(118, 150, 183, 0.12);
+        }
+
+        .record-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .badge-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 28px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+        }
+
+        .badge-green {
+            background: rgba(65, 120, 84, 0.25);
+            color: #9ae0a8;
+        }
+
+        .badge-yellow {
+            background: rgba(138, 116, 58, 0.28);
+            color: #f5d57e;
+        }
+
+        .badge-red {
+            background: rgba(148, 65, 65, 0.3);
+            color: #ffb0b0;
+        }
+
+        .empty {
+            padding: 14px;
+            border-radius: 14px;
+            border: 1px dashed var(--line);
+            color: var(--muted);
+            text-align: center;
+        }
+
+        .tiny {
+            font-size: 12px;
+        }
+
+        @media (max-width: 580px) {
+            .stats-grid,
+            .field-row {
+                grid-template-columns: 1fr;
+            }
+
+            .panel {
+                padding: 14px;
+            }
+
+            .button {
+                flex: 1 1 auto;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-shell">
+        <header class="hero">
+            <p class="hero-kicker">OGame Tracker</p>
+            <h1>Master movil</h1>
+            <p>Control remoto del servidor, objetivos, runner e historial desde el telefono.</p>
+        </header>
+        <main id="app" class="stack"></main>
+    </div>
+    <script>
+        (function() {
+            'use strict';
+
+            const TOKEN_HEADER = 'x-tracker-token';
+            const STORAGE_PREFIX = 'otrMobileMaster:';
+            const CYCLE_OPTIONS = [
+                { value: 60 * 1000, label: '1 min' },
+                { value: 2 * 60 * 1000, label: '2 min' },
+                { value: 5 * 60 * 1000, label: '5 min' },
+                { value: 15 * 60 * 1000, label: '15 min' }
+            ];
+            const HOP_OPTIONS = [
+                { value: 1000, label: '1 s' },
+                { value: 2000, label: '2 s' },
+                { value: 3000, label: '3 s' },
+                { value: 5000, label: '5 s' },
+                { value: 8000, label: '8 s' }
+            ];
+
+            const state = {
+                apiBase: detectApiBase(),
+                token: '',
+                selectedTargetKey: '',
+                cycleIntervalMs: 5 * 60 * 1000,
+                hopDelayMs: 2000,
+                busy: false,
+                status: 'Listo para conectar',
+                error: '',
+                health: null,
+                remoteState: createEmptyRemoteState(),
+                history: createEmptyHistoryState(),
+                forms: {
+                    playerName: '',
+                    playerId: '',
+                    coord: ''
+                }
+            };
+
+            const root = document.getElementById('app');
+            loadPreferences();
+            bindRootEvents();
+            render();
+            registerServiceWorker();
+            refreshState().catch(function(error) {
+                setStatus(error.message, true);
+            });
+
+            function createEmptyRemoteState() {
+                return {
+                    updatedAt: 0,
+                    targets: {},
+                    runner: {
+                        currentPlan: null,
+                        slaveStatus: {
+                            slaveId: '',
+                            state: 'idle',
+                            playerKey: '',
+                            currentCoord: '',
+                            progressIndex: 0,
+                            progressTotal: 0,
+                            activePlanId: '',
+                            lastError: '',
+                            lastSeenAt: 0,
+                            updatedAt: 0,
+                            online: false
+                        }
+                    }
+                };
+            }
+
+            function createEmptyHistoryState() {
+                return {
+                    loading: false,
+                    players: [],
+                    playerKey: '',
+                    meta: null,
+                    dateKey: '',
+                    day: null,
+                    message: 'Pulsa "Actualizar historial"'
+                };
+            }
+
+            function detectApiBase() {
+                const pathname = String(location.pathname || '').replace(/\/+$/, '');
+                const suffix = '/mobile';
+                if (pathname === suffix) {
+                    return '';
+                }
+                if (pathname.endsWith(suffix)) {
+                    return pathname.slice(0, -suffix.length) || '';
+                }
+                return pathname || '';
+            }
+
+            function loadPreferences() {
+                state.token = readStorage('token', '');
+                state.cycleIntervalMs = clampCycleInterval(Number(readStorage('cycleIntervalMs', String(5 * 60 * 1000))));
+                state.hopDelayMs = clampHopDelay(Number(readStorage('hopDelayMs', String(2000))));
+            }
+
+            function savePreferences() {
+                writeStorage('token', state.token);
+                writeStorage('cycleIntervalMs', String(state.cycleIntervalMs));
+                writeStorage('hopDelayMs', String(state.hopDelayMs));
+            }
+
+            function storageKey(name) {
+                return STORAGE_PREFIX + state.apiBase + ':' + name;
+            }
+
+            function readStorage(name, fallback) {
+                try {
+                    const value = localStorage.getItem(storageKey(name));
+                    return value === null ? fallback : value;
+                } catch (error) {
+                    return fallback;
+                }
+            }
+
+            function writeStorage(name, value) {
+                try {
+                    localStorage.setItem(storageKey(name), value);
+                } catch (error) {
+                    return;
+                }
+            }
+
+            function bindRootEvents() {
+                document.addEventListener('click', handleClick);
+                document.addEventListener('submit', handleSubmit);
+                document.addEventListener('change', handleChange);
+                document.addEventListener('input', handleInput);
+            }
+
+            function registerServiceWorker() {
+                if (!('serviceWorker' in navigator) || !window.isSecureContext) {
+                    return;
+                }
+                navigator.serviceWorker.register('./mobile-sw.js', { scope: './' }).catch(function() {
+                    return;
+                });
+            }
+
+            function handleClick(event) {
+                const actionNode = event.target.closest('[data-action]');
+                if (!actionNode) {
+                    return;
+                }
+
+                const action = actionNode.getAttribute('data-action');
+                const targetKey = actionNode.getAttribute('data-target-key') || '';
+                const coord = actionNode.getAttribute('data-coord') || '';
+
+                if (action === 'refresh-state') {
+                    refreshState().catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                    return;
+                }
+                if (action === 'start-runner') {
+                    startRunner().catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                    return;
+                }
+                if (action === 'stop-runner') {
+                    stopRunner().catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                    return;
+                }
+                if (action === 'select-target') {
+                    state.selectedTargetKey = targetKey;
+                    render();
+                    return;
+                }
+                if (action === 'delete-target') {
+                    deleteTarget(targetKey).catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                    return;
+                }
+                if (action === 'remove-coord') {
+                    removeCoord(targetKey, coord).catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                    return;
+                }
+                if (action === 'refresh-history') {
+                    reloadHistory(true).catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                    return;
+                }
+                if (action === 'delete-history') {
+                    deleteCurrentHistory().catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                }
+            }
+
+            function handleSubmit(event) {
+                const form = event.target;
+                if (!form || !form.hasAttribute('data-form')) {
+                    return;
+                }
+                event.preventDefault();
+
+                const formName = form.getAttribute('data-form');
+                if (formName === 'settings') {
+                    state.token = normalizeText(form.elements.token.value);
+                    state.cycleIntervalMs = clampCycleInterval(Number(form.elements.cycleIntervalMs.value));
+                    state.hopDelayMs = clampHopDelay(Number(form.elements.hopDelayMs.value));
+                    savePreferences();
+                    setStatus('Configuracion guardada');
+                    render();
+                    refreshState().catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                    return;
+                }
+                if (formName === 'target-add') {
+                    createTarget().catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                    return;
+                }
+                if (formName === 'coord-add') {
+                    addCoord().catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                }
+            }
+
+            function handleChange(event) {
+                const node = event.target;
+                if (!node || !node.name) {
+                    return;
+                }
+                if (node.name === 'historyPlayer') {
+                    state.history.playerKey = normalizeText(node.value);
+                    state.history.dateKey = '';
+                    state.history.meta = null;
+                    state.history.day = null;
+                    render();
+                    reloadHistory(false).catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                    return;
+                }
+                if (node.name === 'historyDate') {
+                    state.history.dateKey = normalizeText(node.value);
+                    render();
+                    reloadHistory(false).catch(function(error) {
+                        setStatus(error.message, true);
+                    });
+                }
+            }
+
+            function handleInput(event) {
+                const node = event.target;
+                if (!node || !node.name) {
+                    return;
+                }
+                if (node.name === 'playerName') {
+                    state.forms.playerName = node.value;
+                    return;
+                }
+                if (node.name === 'playerId') {
+                    state.forms.playerId = node.value;
+                    return;
+                }
+                if (node.name === 'coord') {
+                    state.forms.coord = node.value;
+                }
+            }
+
+            async function refreshState(options) {
+                const settings = options && typeof options === 'object' ? options : {};
+                const shouldOwnBusy = !settings.keepBusy;
+                if (state.busy && !settings.force) {
+                    return;
+                }
+                if (shouldOwnBusy) {
+                    state.busy = true;
+                    render();
+                }
+                try {
+                    const health = await requestJson('GET', '/health');
+                    const payload = await requestJson('GET', '/state');
+                    state.health = health;
+                    state.remoteState = normalizeRemoteState(payload);
+                    sanitizeSelection();
+                    if (state.history.playerKey) {
+                        const historyKeys = buildHistoryCandidateKeys();
+                        if (historyKeys.indexOf(state.history.playerKey) < 0) {
+                            state.history.playerKey = '';
+                            state.history.dateKey = '';
+                            state.history.meta = null;
+                            state.history.day = null;
+                        }
+                    }
+                    setStatus('Estado actualizado');
+                } finally {
+                    if (shouldOwnBusy) {
+                        state.busy = false;
+                    }
+                    render();
+                }
+            }
+
+            async function createTarget() {
+                const playerName = normalizeText(state.forms.playerName);
+                const playerId = positiveNumber(state.forms.playerId, 0);
+                if (!playerName && playerId <= 0) {
+                    throw new Error('Pon al menos nombre o playerId');
+                }
+                state.busy = true;
+                render();
+                try {
+                    const payload = await requestJson('POST', '/targets/upsert', {
+                        playerName: playerName,
+                        playerId: playerId
+                    });
+                    const target = payload && payload.target ? payload.target : null;
+                    if (target && target.playerKey) {
+                        state.selectedTargetKey = target.playerKey;
+                    }
+                    state.forms.playerName = '';
+                    state.forms.playerId = '';
+                    setStatus('Objetivo guardado');
+                    await refreshState({ force: true, keepBusy: true });
+                } finally {
+                    state.busy = false;
+                    render();
+                }
+            }
+
+            async function addCoord() {
+                const target = getSelectedTarget();
+                if (!target) {
+                    throw new Error('Selecciona un objetivo');
+                }
+                const coord = normalizeCoord(state.forms.coord);
+                if (!coord) {
+                    throw new Error('Coord invalida. Usa G:S:P');
+                }
+                state.busy = true;
+                render();
+                try {
+                    await requestJson('POST', '/targets/coords/add', {
+                        playerKey: target.playerKey,
+                        coord: coord
+                    });
+                    state.forms.coord = '';
+                    setStatus('Coord anadida');
+                    await refreshState({ force: true, keepBusy: true });
+                } finally {
+                    state.busy = false;
+                    render();
+                }
+            }
+
+            async function removeCoord(playerKey, coord) {
+                if (!playerKey || !coord) {
+                    return;
+                }
+                state.busy = true;
+                render();
+                try {
+                    await requestJson('POST', '/targets/coords/remove', {
+                        playerKey: playerKey,
+                        coord: coord
+                    });
+                    setStatus('Coord eliminada');
+                    await refreshState({ force: true, keepBusy: true });
+                } finally {
+                    state.busy = false;
+                    render();
+                }
+            }
+
+            async function deleteTarget(playerKey) {
+                if (!playerKey) {
+                    return;
+                }
+                if (!window.confirm('Borrar el objetivo seleccionado?')) {
+                    return;
+                }
+                state.busy = true;
+                render();
+                try {
+                    await requestJson('POST', '/targets/delete', {
+                        playerKey: playerKey
+                    });
+                    if (state.selectedTargetKey === playerKey) {
+                        state.selectedTargetKey = '';
+                    }
+                    setStatus('Objetivo borrado');
+                    await refreshState({ force: true, keepBusy: true });
+                } finally {
+                    state.busy = false;
+                    render();
+                }
+            }
+
+            async function startRunner() {
+                if (!Object.keys(state.remoteState.targets || {}).length) {
+                    throw new Error('No hay objetivos');
+                }
+                state.busy = true;
+                render();
+                try {
+                    await requestJson('POST', '/runner/start', {
+                        playerKey: state.selectedTargetKey,
+                        cycleIntervalMs: state.cycleIntervalMs,
+                        hopDelayMs: state.hopDelayMs
+                    });
+                    setStatus('Escaneo remoto iniciado');
+                    await refreshState({ force: true, keepBusy: true });
+                } finally {
+                    state.busy = false;
+                    render();
+                }
+            }
+
+            async function stopRunner() {
+                state.busy = true;
+                render();
+                try {
+                    await requestJson('POST', '/runner/stop', {});
+                    setStatus('Escaneo remoto detenido');
+                    await refreshState({ force: true, keepBusy: true });
+                } finally {
+                    state.busy = false;
+                    render();
+                }
+            }
+
+            async function reloadHistory(refreshPlayers) {
+                state.history.loading = true;
+                render();
+                try {
+                    if (refreshPlayers) {
+                        const playersPayload = await requestJson('GET', '/history/players');
+                        state.history.players = Array.isArray(playersPayload && playersPayload.players) ? playersPayload.players : [];
+                    }
+
+                    const candidateKeys = buildHistoryCandidateKeys();
+                    if (!state.history.playerKey || candidateKeys.indexOf(state.history.playerKey) < 0) {
+                        state.history.playerKey = candidateKeys.indexOf(state.selectedTargetKey) >= 0
+                            ? state.selectedTargetKey
+                            : (candidateKeys[0] || '');
+                        state.history.dateKey = '';
+                    }
+
+                    if (!state.history.playerKey) {
+                        state.history.meta = null;
+                        state.history.day = null;
+                        state.history.message = 'No hay jugadores con datos';
+                        return;
+                    }
+
+                    state.history.meta = await requestJson('GET', '/history/meta', undefined, {
+                        playerKey: state.history.playerKey
+                    });
+
+                    const dates = Array.isArray(state.history.meta && state.history.meta.dates) ? state.history.meta.dates : [];
+                    if (!state.history.dateKey || dates.indexOf(state.history.dateKey) < 0) {
+                        state.history.dateKey = dates.length ? dates[dates.length - 1] : '';
+                    }
+
+                    if (!state.history.dateKey) {
+                        state.history.day = null;
+                        state.history.message = 'Sin historial para ese jugador';
+                        return;
+                    }
+
+                    state.history.day = await requestJson('GET', '/history/day', undefined, {
+                        playerKey: state.history.playerKey,
+                        date: state.history.dateKey
+                    });
+                    state.history.message = '';
+                } finally {
+                    state.history.loading = false;
+                    render();
+                }
+            }
+
+            async function deleteCurrentHistory() {
+                if (!state.history.playerKey) {
+                    return;
+                }
+                const label = state.history.meta && state.history.meta.player
+                    ? (state.history.meta.player.playerName || state.history.meta.player.playerKey)
+                    : state.history.playerKey;
+                if (!window.confirm('Borrar el historial de "' + label + '"?')) {
+                    return;
+                }
+                state.history.loading = true;
+                render();
+                try {
+                    await requestJson('POST', '/history/delete-player', {
+                        playerKey: state.history.playerKey
+                    });
+                    state.history.dateKey = '';
+                    state.history.day = null;
+                    setStatus('Historial borrado');
+                    await reloadHistory(true);
+                } finally {
+                    state.history.loading = false;
+                    render();
+                }
+            }
+
+            async function requestJson(method, path, body, queryParams) {
+                const url = buildApiUrl(path, queryParams);
+                const headers = {};
+                if (body !== undefined) {
+                    headers['content-type'] = 'application/json';
+                }
+                if (state.token) {
+                    headers[TOKEN_HEADER] = state.token;
+                }
+
+                const response = await fetch(url, {
+                    method: method,
+                    headers: headers,
+                    body: body !== undefined ? JSON.stringify(body) : undefined,
+                    cache: 'no-store'
+                });
+
+                const text = await response.text();
+                let payload = {};
+                if (text) {
+                    try {
+                        payload = JSON.parse(text);
+                    } catch (error) {
+                        throw new Error('Respuesta JSON invalida');
+                    }
+                }
+
+                if (!response.ok) {
+                    throw new Error(payload && payload.error ? payload.error : ('HTTP ' + response.status));
+                }
+
+                return payload;
+            }
+
+            function buildApiUrl(path, queryParams) {
+                const url = new URL(location.origin + state.apiBase + path);
+                if (queryParams && typeof queryParams === 'object') {
+                    Object.keys(queryParams).forEach(function(key) {
+                        const value = queryParams[key];
+                        if (value === undefined || value === null || value === '') {
+                            return;
+                        }
+                        url.searchParams.set(key, String(value));
+                    });
+                }
+                return url.toString();
+            }
+
+            function normalizeRemoteState(input) {
+                const normalized = createEmptyRemoteState();
+                if (!input || typeof input !== 'object') {
+                    return normalized;
+                }
+                normalized.updatedAt = positiveNumber(input.updatedAt, 0);
+                normalized.targets = normalizeTargets(input.targets);
+                if (input.runner && typeof input.runner === 'object') {
+                    normalized.runner.currentPlan = input.runner.currentPlan || null;
+                    normalized.runner.slaveStatus = normalizeSlaveStatus(input.runner.slaveStatus);
+                }
+                return normalized;
+            }
+
+            function normalizeTargets(input) {
+                const next = {};
+                if (!input || typeof input !== 'object') {
+                    return next;
+                }
+                Object.keys(input).forEach(function(playerKey) {
+                    const target = input[playerKey];
+                    if (!target || typeof target !== 'object') {
+                        return;
+                    }
+                    const key = normalizeText(target.playerKey || playerKey);
+                    if (!key) {
+                        return;
+                    }
+                    next[key] = {
+                        playerKey: key,
+                        playerId: positiveNumber(target.playerId, 0),
+                        playerName: normalizeText(target.playerName || key) || key,
+                        coords: normalizeCoords(target.coords || []),
+                        addedAt: positiveNumber(target.addedAt, 0),
+                        updatedAt: positiveNumber(target.updatedAt, 0)
+                    };
+                });
+                return next;
+            }
+
+            function normalizeSlaveStatus(input) {
+                const status = createEmptyRemoteState().runner.slaveStatus;
+                if (!input || typeof input !== 'object') {
+                    return status;
+                }
+                status.slaveId = normalizeText(input.slaveId);
+                status.state = normalizeText(input.state || 'idle') || 'idle';
+                status.playerKey = normalizeText(input.playerKey);
+                status.currentCoord = normalizeCoord(input.currentCoord);
+                status.progressIndex = Math.max(0, positiveNumber(input.progressIndex, 0));
+                status.progressTotal = Math.max(0, positiveNumber(input.progressTotal, 0));
+                status.activePlanId = normalizeText(input.activePlanId);
+                status.lastError = normalizeText(input.lastError);
+                status.lastSeenAt = positiveNumber(input.lastSeenAt, 0);
+                status.updatedAt = positiveNumber(input.updatedAt, 0);
+                status.online = Boolean(input.online);
+                return status;
+            }
+
+            function sanitizeSelection() {
+                const keys = getTargetKeys();
+                if (state.selectedTargetKey && keys.indexOf(state.selectedTargetKey) >= 0) {
+                    return;
+                }
+                const preferredKey = normalizeText(
+                    state.remoteState.runner &&
+                    state.remoteState.runner.currentPlan &&
+                    state.remoteState.runner.currentPlan.preferredPlayerKey
+                );
+                state.selectedTargetKey = keys.indexOf(preferredKey) >= 0 ? preferredKey : (keys[0] || '');
+            }
+
+            function buildHistoryCandidateKeys() {
+                const keys = new Set();
+                getTargetKeys().forEach(function(playerKey) {
+                    keys.add(playerKey);
+                });
+                state.history.players.forEach(function(player) {
+                    if (player && player.playerKey) {
+                        keys.add(player.playerKey);
+                    }
+                });
+                return Array.from(keys).sort(comparePlayerKeys);
+            }
+
+            function getSelectedTarget() {
+                return state.selectedTargetKey ? state.remoteState.targets[state.selectedTargetKey] || null : null;
+            }
+
+            function getTargetKeys() {
+                return Object.keys(state.remoteState.targets || {}).sort(comparePlayerKeys);
+            }
+
+            function comparePlayerKeys(leftKey, rightKey) {
+                const left = state.remoteState.targets[leftKey] || findHistoryPlayer(leftKey) || { playerName: leftKey };
+                const right = state.remoteState.targets[rightKey] || findHistoryPlayer(rightKey) || { playerName: rightKey };
+                return String(left.playerName || leftKey).localeCompare(String(right.playerName || rightKey), 'es', { sensitivity: 'base' });
+            }
+
+            function findHistoryPlayer(playerKey) {
+                return state.history.players.find(function(player) {
+                    return player && player.playerKey === playerKey;
+                }) || null;
+            }
+
+            function render() {
+                const health = state.health;
+                const currentPlan = state.remoteState.runner.currentPlan;
+                const slaveStatus = state.remoteState.runner.slaveStatus;
+                const target = getSelectedTarget();
+                const targetKeys = getTargetKeys();
+                const historyPlayerOptions = buildHistoryCandidateKeys();
+
+                root.innerHTML = [
+                    renderConnectionPanel(health),
+                    renderOverviewPanel(currentPlan, slaveStatus, targetKeys.length),
+                    renderTargetManagementPanel(target),
+                    renderTargetListPanel(targetKeys),
+                    renderHistoryPanel(historyPlayerOptions)
+                ].join('');
+            }
+
+            function renderConnectionPanel(health) {
+                const endpoint = location.origin + state.apiBase;
+                const tokenServer = health ? (health.tokenEnabled ? 'on' : 'off') : '-';
+                return [
+                    '<section class="panel">',
+                    '  <div class="panel-head">',
+                    '    <div>',
+                    '      <h2 class="panel-title">Conexion</h2>',
+                    '      <p class="panel-subtitle">Abre esta URL en el movil y usa el mismo token del servidor si lo tienes activado.</p>',
+                    '    </div>',
+                    '  </div>',
+                    '  <form class="panel-grid" data-form="settings">',
+                    '    <div class="status ' + (state.error ? 'status-error' : 'status-ok') + '">',
+                    '      <strong>' + escapeHtml(state.error || state.status) + '</strong>',
+                    '      <span class="muted tiny">Endpoint: ' + escapeHtml(endpoint) + ' | Token servidor: ' + escapeHtml(tokenServer) + '</span>',
+                    '    </div>',
+                    '    <div class="field-grid">',
+                    '      <div class="field">',
+                    '        <label for="tokenInput">Token</label>',
+                    '        <input id="tokenInput" class="text-input" name="token" type="password" autocomplete="off" value="' + escapeHtml(state.token) + '" placeholder="Opcional">',
+                    '      </div>',
+                    '      <div class="field-row">',
+                    '        <div class="field">',
+                    '          <label for="cycleSelect">Ciclo</label>',
+                    '          <select id="cycleSelect" class="select-input" name="cycleIntervalMs">' + renderNumberOptions(CYCLE_OPTIONS, state.cycleIntervalMs) + '</select>',
+                    '        </div>',
+                    '        <div class="field">',
+                    '          <label for="hopSelect">Saltos</label>',
+                    '          <select id="hopSelect" class="select-input" name="hopDelayMs">' + renderNumberOptions(HOP_OPTIONS, state.hopDelayMs) + '</select>',
+                    '        </div>',
+                    '      </div>',
+                    '    </div>',
+                    '    <div class="button-row">',
+                    '      <button class="button button-primary" type="submit"' + disabledAttr() + '>Guardar</button>',
+                    '      <button class="button button-secondary" type="button" data-action="refresh-state"' + disabledAttr() + '>Actualizar</button>',
+                    '    </div>',
+                    '  </form>',
+                    '</section>'
+                ].join('');
+            }
+
+            function renderOverviewPanel(currentPlan, slaveStatus, targetCount) {
+                const slaveLine = slaveStatus.online
+                    ? (slaveStatus.state + (slaveStatus.currentCoord ? ' | ' + slaveStatus.currentCoord : ''))
+                    : 'offline';
+                const progressLine = slaveStatus.progressTotal > 0
+                    ? (String(slaveStatus.progressIndex) + '/' + String(slaveStatus.progressTotal))
+                    : '-';
+                const preferred = currentPlan && currentPlan.preferredPlayerKey
+                    ? findPlayerLabel(currentPlan.preferredPlayerKey)
+                    : 'ninguno';
+
+                return [
+                    '<section class="panel">',
+                    '  <div class="panel-head">',
+                    '    <div>',
+                    '      <h2 class="panel-title">Estado remoto</h2>',
+                    '      <p class="panel-subtitle">Resumen rapido del runner y del slave.</p>',
+                    '    </div>',
+                    '  </div>',
+                    '  <div class="stats-grid">',
+                    '    <div class="stat"><span class="stat-label">Objetivos</span><span class="stat-value">' + String(targetCount) + '</span></div>',
+                    '    <div class="stat"><span class="stat-label">Runner</span><span class="stat-value">' + escapeHtml(currentPlan ? 'Activo' : 'Parado') + '</span></div>',
+                    '    <div class="stat"><span class="stat-label">Slave</span><span class="stat-value">' + escapeHtml(slaveLine) + '</span></div>',
+                    '    <div class="stat"><span class="stat-label">Progreso</span><span class="stat-value">' + escapeHtml(progressLine) + '</span></div>',
+                    '  </div>',
+                    '  <div class="divider"></div>',
+                    '  <div class="panel-grid">',
+                    '    <div class="meta-line">Preferido al iniciar: ' + escapeHtml(preferred) + '</div>',
+                    '    <div class="meta-line">Ultima actualizacion del slave: ' + escapeHtml(formatDateTime(slaveStatus.lastSeenAt) || '-') + '</div>',
+                    (slaveStatus.lastError ? '    <div class="meta-line">Ultimo error: ' + escapeHtml(slaveStatus.lastError) + '</div>' : ''),
+                    '    <div class="button-row">',
+                    '      <button class="button button-primary" type="button" data-action="start-runner"' + disabledAttr() + '>Iniciar escaneo</button>',
+                    '      <button class="button button-danger" type="button" data-action="stop-runner"' + disabledAttr() + '>Parar escaneo</button>',
+                    '    </div>',
+                    '  </div>',
+                    '</section>'
+                ].join('');
+            }
+
+            function renderTargetManagementPanel(target) {
+                const coordChips = target && target.coords.length
+                    ? target.coords.map(function(coord) {
+                        return '<span class="chip">' +
+                            escapeHtml(coord) +
+                            '<button type="button" data-action="remove-coord" data-target-key="' + escapeHtml(target.playerKey) + '" data-coord="' + escapeHtml(coord) + '"' + disabledAttr() + '>x</button>' +
+                            '</span>';
+                    }).join('')
+                    : '<div class="empty">Sin coords registradas</div>';
+
+                return [
+                    '<section class="panel">',
+                    '  <div class="panel-head">',
+                    '    <div>',
+                    '      <h2 class="panel-title">Gestion de objetivos</h2>',
+                    '      <p class="panel-subtitle">Alta manual, seleccion preferente y mantenimiento de coords.</p>',
+                    '    </div>',
+                    '  </div>',
+                    '  <form class="panel-grid" data-form="target-add">',
+                    '    <div class="field-row">',
+                    '      <div class="field">',
+                    '        <label for="playerNameInput">Jugador</label>',
+                    '        <input id="playerNameInput" class="text-input" name="playerName" value="' + escapeHtml(state.forms.playerName) + '" placeholder="Nombre visible">',
+                    '      </div>',
+                    '      <div class="field">',
+                    '        <label for="playerIdInput">Player ID</label>',
+                    '        <input id="playerIdInput" class="text-input" name="playerId" inputmode="numeric" value="' + escapeHtml(state.forms.playerId) + '" placeholder="Opcional">',
+                    '      </div>',
+                    '    </div>',
+                    '    <div class="button-row">',
+                    '      <button class="button button-secondary" type="submit"' + disabledAttr() + '>Guardar objetivo</button>',
+                    '    </div>',
+                    '  </form>',
+                    '  <div class="divider"></div>',
+                    '  <div class="panel-grid">',
+                    '    <div class="meta-line">Seleccionado: ' + escapeHtml(target ? findPlayerLabel(target.playerKey) : 'ninguno') + '</div>',
+                    '    <div class="chip-row">' + coordChips + '</div>',
+                    '    <form class="panel-grid" data-form="coord-add">',
+                    '      <div class="field">',
+                    '        <label for="coordInput">Nueva coord</label>',
+                    '        <input id="coordInput" class="text-input" name="coord" value="' + escapeHtml(state.forms.coord) + '" placeholder="Ej: 1:234:8">',
+                    '      </div>',
+                    '      <div class="button-row">',
+                    '        <button class="button button-secondary" type="submit"' + disabledAttr() + '>Anadir coord</button>',
+                    (target ? '        <button class="button button-danger" type="button" data-action="delete-target" data-target-key="' + escapeHtml(target.playerKey) + '"' + disabledAttr() + '>Borrar objetivo</button>' : ''),
+                    '      </div>',
+                    '    </form>',
+                    '  </div>',
+                    '</section>'
+                ].join('');
+            }
+
+            function renderTargetListPanel(targetKeys) {
+                const cards = targetKeys.length
+                    ? targetKeys.map(function(playerKey) {
+                        const target = state.remoteState.targets[playerKey];
+                        const isSelected = target && target.playerKey === state.selectedTargetKey;
+                        return [
+                            '<article class="target-card' + (isSelected ? ' selected' : '') + '">',
+                            '  <div class="target-head">',
+                            '    <div>',
+                            '      <h3 class="target-name">' + escapeHtml(findPlayerLabel(playerKey)) + '</h3>',
+                            '      <div class="meta-line">' + String((target && target.coords ? target.coords.length : 0)) + ' coords | actualizado ' + escapeHtml(formatRelativeTime(target && target.updatedAt)) + '</div>',
+                            '    </div>',
+                            '    <button class="button button-ghost" type="button" data-action="select-target" data-target-key="' + escapeHtml(playerKey) + '"' + disabledAttr() + '>Seleccionar</button>',
+                            '  </div>',
+                            '  <div class="chip-row">' + renderCoordPreview(target) + '</div>',
+                            '</article>'
+                        ].join('');
+                    }).join('')
+                    : '<div class="empty">No hay objetivos todavia.</div>';
+
+                return [
+                    '<section class="panel">',
+                    '  <div class="panel-head">',
+                    '    <div>',
+                    '      <h2 class="panel-title">Objetivos</h2>',
+                    '      <p class="panel-subtitle">El runner recorrera todos. El seleccionado se usa como preferente al iniciar.</p>',
+                    '    </div>',
+                    '  </div>',
+                    '  <div class="target-list">' + cards + '</div>',
+                    '</section>'
+                ].join('');
+            }
+
+            function renderHistoryPanel(historyPlayerOptions) {
+                const playerOptions = ['<option value="">-- Jugador --</option>'].concat(historyPlayerOptions.map(function(playerKey) {
+                    const selected = playerKey === state.history.playerKey ? ' selected' : '';
+                    return '<option value="' + escapeHtml(playerKey) + '"' + selected + '>' + escapeHtml(findPlayerLabel(playerKey)) + '</option>';
+                })).join('');
+
+                const dates = Array.isArray(state.history.meta && state.history.meta.dates) ? state.history.meta.dates : [];
+                const dateOptions = ['<option value="">-- Fecha --</option>'].concat(dates.map(function(dateKey) {
+                    const selected = dateKey === state.history.dateKey ? ' selected' : '';
+                    return '<option value="' + escapeHtml(dateKey) + '"' + selected + '>' + escapeHtml(dateKey) + '</option>';
+                })).join('');
+
+                return [
+                    '<section class="panel">',
+                    '  <div class="panel-head">',
+                    '    <div>',
+                    '      <h2 class="panel-title">Historial</h2>',
+                    '      <p class="panel-subtitle">Vista compacta pensada para movil.</p>',
+                    '    </div>',
+                    '  </div>',
+                    '  <div class="panel-grid">',
+                    '    <div class="field-row">',
+                    '      <div class="field">',
+                    '        <label for="historyPlayerSelect">Jugador</label>',
+                    '        <select id="historyPlayerSelect" class="select-input" name="historyPlayer">' + playerOptions + '</select>',
+                    '      </div>',
+                    '      <div class="field">',
+                    '        <label for="historyDateSelect">Fecha</label>',
+                    '        <select id="historyDateSelect" class="select-input" name="historyDate">' + dateOptions + '</select>',
+                    '      </div>',
+                    '    </div>',
+                    '    <div class="button-row">',
+                    '      <button class="button button-secondary" type="button" data-action="refresh-history"' + disabledAttr(state.history.loading) + '>' + (state.history.loading ? 'Cargando...' : 'Actualizar historial') + '</button>',
+                    '      <button class="button button-danger" type="button" data-action="delete-history"' + disabledAttr(state.history.loading || !state.history.playerKey) + '>Borrar historial</button>',
+                    '    </div>',
+                    '    <div class="meta-line">' + escapeHtml(renderHistoryMeta()) + '</div>',
+                    renderHistoryContent(),
+                    '  </div>',
+                    '</section>'
+                ].join('');
+            }
+
+            function renderHistoryMeta() {
+                if (state.history.loading) {
+                    return 'Cargando historial...';
+                }
+                if (state.history.message) {
+                    return state.history.message;
+                }
+                if (!state.history.meta || !state.history.meta.player) {
+                    return 'Sin datos';
+                }
+                const player = state.history.meta.player;
+                const coordsCount = Array.isArray(state.history.meta.coords) ? state.history.meta.coords.length : 0;
+                return 'Jugador: ' + (player.playerName || player.playerKey) + ' | coords: ' + String(coordsCount);
+            }
+
+            function renderHistoryContent() {
+                if (state.history.loading) {
+                    return '<div class="empty">Cargando historial...</div>';
+                }
+                if (state.history.message) {
+                    return '<div class="empty">' + escapeHtml(state.history.message) + '</div>';
+                }
+                if (!state.history.day || !Array.isArray(state.history.day.records) || !state.history.day.records.length) {
+                    return '<div class="empty">Sin registros para ese dia.</div>';
+                }
+
+                const groups = groupRecordsByCoord(state.history.day.records);
+                return '<div class="history-groups">' + Object.keys(groups).sort(compareCoords).map(function(coord) {
+                    return renderHistoryGroup(coord, groups[coord]);
+                }).join('') + '</div>';
+            }
+
+            function renderHistoryGroup(coord, records) {
+                const items = records.map(function(record) {
+                    return [
+                        '<div class="record">',
+                        '  <div class="record-top">',
+                        '    <strong>' + escapeHtml(formatDateTime(record.scannedAt, true)) + '</strong>',
+                        '    <span class="muted tiny">Bloque ' + escapeHtml(formatDateTime(record.bucketTs, true)) + '</span>',
+                        '  </div>',
+                        '  <div class="badge-row">',
+                        '    <span class="badge ' + activityBadgeClass(record.planetActivity) + '">P: ' + escapeHtml(formatActivity(record.planetActivity)) + '</span>',
+                        '    <span class="badge ' + activityBadgeClass(record.moonActivity) + '">L: ' + escapeHtml(formatActivity(record.moonActivity)) + '</span>',
+                        '    <span class="badge ' + (record.debris === 'si' ? 'badge-yellow' : 'badge-green') + '">D: ' + escapeHtml(record.debris || 'no') + '</span>',
+                        '  </div>',
+                        '</div>'
+                    ].join('');
+                }).join('');
+
+                return [
+                    '<article class="history-card">',
+                    '  <div class="history-head">',
+                    '    <h3 class="history-coord">' + escapeHtml(coord) + '</h3>',
+                    '    <span class="muted tiny">' + String(records.length) + ' registros</span>',
+                    '  </div>',
+                    '  <div class="record-list">' + items + '</div>',
+                    '</article>'
+                ].join('');
+            }
+
+            function renderCoordPreview(target) {
+                const coords = target && Array.isArray(target.coords) ? target.coords : [];
+                if (!coords.length) {
+                    return '<span class="chip">Sin coords</span>';
+                }
+                return coords.slice(0, 4).map(function(coord) {
+                    return '<span class="chip">' + escapeHtml(coord) + '</span>';
+                }).join('') + (coords.length > 4 ? '<span class="chip">+' + String(coords.length - 4) + '</span>' : '');
+            }
+
+            function renderNumberOptions(options, selectedValue) {
+                return options.map(function(option) {
+                    const selected = Number(option.value) === Number(selectedValue) ? ' selected' : '';
+                    return '<option value="' + String(option.value) + '"' + selected + '>' + escapeHtml(option.label) + '</option>';
+                }).join('');
+            }
+
+            function groupRecordsByCoord(records) {
+                return (Array.isArray(records) ? records : []).reduce(function(groups, record) {
+                    const coord = normalizeCoord(record && record.coord);
+                    if (!coord) {
+                        return groups;
+                    }
+                    if (!groups[coord]) {
+                        groups[coord] = [];
+                    }
+                    groups[coord].push(record);
+                    groups[coord].sort(function(left, right) {
+                        return positiveNumber(left.scannedAt, 0) - positiveNumber(right.scannedAt, 0);
+                    });
+                    return groups;
+                }, {});
+            }
+
+            function formatActivity(value) {
+                const raw = normalizeText(value || '-');
+                if (raw === '*') {
+                    return '*';
+                }
+                return raw || '-';
+            }
+
+            function activityBadgeClass(value) {
+                const raw = normalizeText(value || '-');
+                if (raw === '*') {
+                    return 'badge-red';
+                }
+                if (raw && raw !== '-') {
+                    return 'badge-yellow';
+                }
+                return 'badge-green';
+            }
+
+            function findPlayerLabel(playerKey) {
+                const target = state.remoteState.targets[playerKey] || null;
+                const historyPlayer = findHistoryPlayer(playerKey);
+                return (target && target.playerName) ||
+                    (historyPlayer && historyPlayer.playerName) ||
+                    playerKey ||
+                    '-';
+            }
+
+            function disabledAttr(forceDisabled) {
+                return (forceDisabled || state.busy) ? ' disabled' : '';
+            }
+
+            function normalizeText(value) {
+                return String(value || '').trim();
+            }
+
+            function positiveNumber(value, fallback) {
+                const number = Number(value);
+                return Number.isFinite(number) && number > 0 ? number : fallback;
+            }
+
+            function clampCycleInterval(value) {
+                return CYCLE_OPTIONS.some(function(option) {
+                    return Number(option.value) === Number(value);
+                }) ? Number(value) : (5 * 60 * 1000);
+            }
+
+            function clampHopDelay(value) {
+                return HOP_OPTIONS.some(function(option) {
+                    return Number(option.value) === Number(value);
+                }) ? Number(value) : 2000;
+            }
+
+            function normalizeCoord(value) {
+                const raw = normalizeText(value);
+                if (!raw) {
+                    return '';
+                }
+                const parts = raw.split(':').map(function(part) {
+                    return Number(part);
+                });
+                if (parts.length !== 3 || parts.some(function(part) { return !Number.isFinite(part) || part <= 0; })) {
+                    return '';
+                }
+                return parts.join(':');
+            }
+
+            function normalizeCoords(values) {
+                if (!Array.isArray(values)) {
+                    return [];
+                }
+                const seen = new Set();
+                values.forEach(function(value) {
+                    const coord = normalizeCoord(value);
+                    if (coord) {
+                        seen.add(coord);
+                    }
+                });
+                return Array.from(seen).sort(compareCoords);
+            }
+
+            function compareCoords(left, right) {
+                const leftParts = String(left || '').split(':').map(Number);
+                const rightParts = String(right || '').split(':').map(Number);
+                for (let index = 0; index < 3; index += 1) {
+                    const leftValue = Number.isFinite(leftParts[index]) ? leftParts[index] : 0;
+                    const rightValue = Number.isFinite(rightParts[index]) ? rightParts[index] : 0;
+                    if (leftValue !== rightValue) {
+                        return leftValue - rightValue;
+                    }
+                }
+                return 0;
+            }
+
+            function formatDateTime(ts, onlyTime) {
+                const value = positiveNumber(ts, 0);
+                if (!value) {
+                    return '';
+                }
+                const options = onlyTime
+                    ? { hour: '2-digit', minute: '2-digit' }
+                    : { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' };
+                return new Date(value).toLocaleString([], options);
+            }
+
+            function formatRelativeTime(ts) {
+                const value = positiveNumber(ts, 0);
+                if (!value) {
+                    return '-';
+                }
+                const diff = Date.now() - value;
+                if (diff < 60 * 1000) {
+                    return 'ahora';
+                }
+                if (diff < 60 * 60 * 1000) {
+                    return Math.round(diff / (60 * 1000)) + ' min';
+                }
+                if (diff < 24 * 60 * 60 * 1000) {
+                    return Math.round(diff / (60 * 60 * 1000)) + ' h';
+                }
+                return Math.round(diff / (24 * 60 * 60 * 1000)) + ' d';
+            }
+
+            function escapeHtml(value) {
+                return String(value || '').replace(/[&<>"']/g, function(char) {
+                    if (char === '&') {
+                        return '&amp;';
+                    }
+                    if (char === '<') {
+                        return '&lt;';
+                    }
+                    if (char === '>') {
+                        return '&gt;';
+                    }
+                    if (char === '"') {
+                        return '&quot;';
+                    }
+                    return '&#39;';
+                });
+            }
+
+            function setStatus(message, isError) {
+                state.error = isError ? normalizeText(message) : '';
+                state.status = isError ? '' : normalizeText(message);
+                render();
+            }
+        })();
+    </script>
+</body>
+</html>
